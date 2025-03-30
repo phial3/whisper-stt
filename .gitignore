@@ -1,3 +1,13 @@
 /target
+/build
+/debug
+/output
 /Cargo.lock
+
+.idea
+.vscode
+.DS_Store
+
+/migrations/
 /models/
+/test_models/
