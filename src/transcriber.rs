@@ -46,12 +46,9 @@ impl Transcriber {
 
         let mut state: whisper_rs::WhisperState =
             self.ctx.create_state().expect("Failed to create state");
-        let params: whisper_rs::FullParams = match whisper_params {
-            Some(whisper_params) => whisper_params,
-            None => {
-                whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 })
-            }
-        };
+        let params: whisper_rs::FullParams = whisper_params.unwrap_or_else(|| {
+            whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy { best_of: 1 })
+        });
 
         state
             .full(params, &audio_data[..])
@@ -87,15 +84,16 @@ impl Transcriber {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::model_handler;
 
-    use super::*;
+    const MODEL_DIR: &'static str = "test_models/";
 
     #[tokio::test]
     async fn component_test_happy_case() {
         let expected_result = " By what he is said and done, a man judges himself by what he is willing to do, by what he might have said, or might have done, a judgment that is necessarily hapered, but only by the scope and limits of his imagination, but by the ever-changing measure of his doubt and self-esteem.";
 
-        let tiny_model_handler = model_handler::ModelHandler::new("Tiny", "models").await;
+        let tiny_model_handler = model_handler::ModelHandler::new("Tiny", MODEL_DIR).await;
         let whisper_wrp = Transcriber::new(tiny_model_handler);
 
         let result = whisper_wrp
@@ -105,6 +103,6 @@ mod tests {
 
         assert_eq!(expected_result, result_text);
 
-        let _ = std::fs::remove_dir_all("models/");
+        let _ = std::fs::remove_dir_all(MODEL_DIR);
     }
 }
