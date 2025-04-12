@@ -27,7 +27,6 @@ impl ModelHandler {
             return model_handler;
         }
 
-        let _ = model_handler.setup_directory();
         let _ = model_handler.download_model().await;
 
         model_handler

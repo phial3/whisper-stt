@@ -1,12 +1,12 @@
-use simple_transcribe_rs::model_handler;
-use simple_transcribe_rs::transcriber;
 use whisper_rs::FullParams;
 use whisper_rs::SamplingStrategy;
+use whisper_stt::model_handler::ModelHandler;
+use whisper_stt::transcriber::Transcriber;
 
 #[tokio::main]
 async fn main() {
-    let m = model_handler::ModelHandler::new("large", "models/").await;
-    let trans = transcriber::Transcriber::new(m);
+    let m = ModelHandler::new("large", "models/").await;
+    let trans = Transcriber::new(m);
     let mut params = FullParams::new(SamplingStrategy::default());
     params.set_language(Some("zh"));
 
