@@ -25,3 +25,9 @@ ctrlc = "3.5"
 cpal = "0.18"
 hound = "3.5"
 rodio = "0.22"
+rubato = "5.0"
+voice-engine = "0.3"
+# Blocked: `flexaudio` 0.2 depends on `cpal` 0.16, whose ALSA backend pulls in
+# `alsa-sys`, and cargo will not let two packages claim the same `links = "alsa"`
+# in one graph. Revisit once flexaudio moves to cpal 0.18 (or drop our cpal dep).
+# flexaudio = "0.2"

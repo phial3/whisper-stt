@@ -47,6 +47,10 @@ their projects quickly 🌩️
 
 - Returns per-segment results with timestamps, so subtitles and word timelines come for free.
 
+- Ships runnable examples for the whole pipeline: `recording` / `record_cpal` capture the microphone
+  interactively, `resample` compares high-quality resamplers (`rubato`), and `vad` cuts silence out
+  before transcribing with an offline neural VAD (`voice-engine`).
+
 ## Getting started
 
 Add the crate to your project's `Cargo.toml`:
@@ -107,6 +111,53 @@ Anything not covered by `TranscriptionOptions` (grammars, callbacks, VAD, token-
 GPU offload) stays reachable: build a `whisper_rs::FullParams` yourself and call
 `Transcriber::transcribe_with_params`, or use `Transcriber::new_with_params` to pass
 `WhisperContextParameters`.
+
+### Better resampling with rubato
+
+`whisper_stt::audio::resample` uses linear interpolation: cheap, but it lets everything above the
+new Nyquist limit alias back into the audio. When the resampling itself matters, rubato does it
+properly. `examples/resample.rs` measures both:
+
+```text
+cargo run --example resample                                   # assets/test.mp3, every engine
+cargo run --example resample -- assets/test.mp3 --engine sinc
+cargo run --example resample -- assets/test.mp3 --out out.wav  # write a 16 kHz WAV
+```
+
+It resamples the clip with each engine and times it, then runs an anti-aliasing probe: a synthetic
+24 kHz signal holding a 3 kHz tone (which must survive) and a 10 kHz tone (which sits above the
+8 kHz Nyquist limit of 16 kHz and must be filtered out). Whatever lands back at 6 kHz is aliasing:
+
+```text
+engine               3 kHz kept    6 kHz alias
+fft                     -6.0 dB      < -120 dB
+sinc                    -6.0 dB      < -120 dB
+poly                    -6.0 dB        -8.4 dB
+linear (built-in)       -6.4 dB       -10.0 dB
+```
+
+`Fft` is the default choice for fixed-rate file conversion, `Async::new_sinc` for a ratio that can
+drift, `Async::new_poly` when CPU matters more than the filter. rubato 5.0 works on `audioadapter`
+buffers, so the input is wrapped in an `InterleavedSlice` and read back through the `Adapter` trait.
+
+### Cutting silence before transcribing
+
+Transcribing silence wastes time and invites hallucinated filler. `examples/vad.rs` segments audio
+with the neural VADs built into `voice-engine` — Rust ports of Silero and Ten VAD with the weights
+baked into the crate, so it runs fully offline with no model download and no ONNX runtime:
+
+```text
+cargo run --example vad                                      # assets/test.mp3, Silero
+cargo run --example vad -- assets/test.mp3 --engine ten      # the Ten VAD instead
+cargo run --example vad -- assets/test.mp3 --threshold 0.3   # more permissive
+cargo run --example vad -- assets/test.mp3 --out speech.wav  # keep only the speech
+```
+
+It prints a probability timeline, lists the segments it found with timestamps, and can write a
+speech-only 16 kHz WAV you can hand straight to `Transcriber::transcribe_file`. The two detectors
+take different frame sizes (Silero 512 samples, Ten 256) and score on different scales — on the
+same clip Ten's probabilities run well below Silero's, so the default threshold follows the engine.
+Compare both on your own audio before trusting one.
 
 ### Recording the microphone
 
