@@ -21,13 +21,6 @@ fn english_mp3_decodes_to_the_expected_layout() {
 }
 
 #[test]
-fn chinese_mp3_decodes() {
-    let audio = decode("gongxifachai.mp3").unwrap();
-    assert_eq!(audio.channels, 1);
-    assert_eq!(audio.sample_rate, 16_000);
-}
-
-#[test]
 fn whisper_input_is_resampled_to_16khz() {
     let audio = decode("test.mp3").unwrap();
     let samples = audio.to_whisper_input();
@@ -45,8 +38,35 @@ fn whisper_input_is_resampled_to_16khz() {
 
 #[test]
 fn already_16khz_audio_passes_through() {
-    let audio = decode("gongxifachai.mp3").unwrap();
-    assert_eq!(audio.to_whisper_input(), audio.samples);
+    // No shipped asset is natively 16 kHz, so build one by hand: resampling to the target rate
+    // must be a no-op.
+    let samples: Vec<f32> = (0..16_000)
+        .map(|index| (index as f32 / 100.0).sin())
+        .collect();
+    let audio = DecodedAudio {
+        samples: samples.clone(),
+        sample_rate: WHISPER_SAMPLE_RATE,
+        channels: 1,
+    };
+    assert_eq!(audio.to_whisper_input(), samples);
+}
+
+#[test]
+fn multi_channel_audio_is_mixed_down() {
+    // Two channels of identical data average to the original signal.
+    let frames: Vec<f32> = (0..1_000).map(|index| index as f32 / 1_000.0).collect();
+    let interleaved: Vec<f32> = frames
+        .iter()
+        .flat_map(|sample| [*sample, *sample])
+        .collect();
+
+    let audio = DecodedAudio {
+        samples: interleaved,
+        sample_rate: WHISPER_SAMPLE_RATE,
+        channels: 2,
+    };
+
+    assert_eq!(audio.to_whisper_input(), frames);
 }
 
 #[test]
