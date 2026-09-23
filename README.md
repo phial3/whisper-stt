@@ -1,60 +1,132 @@
-# SimpleTranscribe-rs 🔈 📖
+# whisper-stt 🔈 📖
 
-An audio to text transcription library written in rust that utilizes [Whisper-rs](https://github.com/tazz4843/whisper-rs) bindings.
+An audio to text transcription library written in Rust that utilizes
+[whisper-rs](https://crates.io/crates/whisper-rs) bindings.
 
 <img src="readme_logo.jpg" width="400" height="400">
 
-## What is SimpleTranscribe-rs?
+## What is whisper-stt?
 
-SimpleTranscribe-rs is a library written in Rust with the goal of making audio to text transcription simple for developers. SimpleTranscribe-rs handles different aspects of setting up audio to text transcription, such as automatically downloading required whisper text-to-speech models. The aim is for developers to be able to incorporate transcription in their projects quickly 🌩️
+whisper-stt is a library written in Rust with the goal of making audio to text transcription simple
+for developers. It handles the boring parts of running Whisper: downloading and caching a model,
+decoding arbitrary audio into the mono 16 kHz float stream Whisper expects, and reading the results
+back out as structured segments. The aim is for developers to be able to incorporate transcription in
+their projects quickly 🌩️
 
 ## Features
 
-- Automatically downloads Models that have no already been installed. Supported models:
+- Automatically downloads models that have not already been installed. **All twelve checkpoints
+  whisper-rs supports** are available:
 
-  - Tiny
-  - Base
-  - Small
-  - Medium
-  - Large
+  | Model | Multilingual | File |
+  |---|---|---|
+  | `tiny` | ✅ | `ggml-tiny.bin` |
+  | `tiny.en` | ❌ | `ggml-tiny.en.bin` |
+  | `base` | ✅ | `ggml-base.bin` |
+  | `base.en` | ❌ | `ggml-base.en.bin` |
+  | `small` | ✅ | `ggml-small.bin` |
+  | `small.en` | ❌ | `ggml-small.en.bin` |
+  | `medium` | ✅ | `ggml-medium.bin` |
+  | `medium.en` | ❌ | `ggml-medium.en.bin` |
+  | `large-v1` | ✅ | `ggml-large-v1.bin` |
+  | `large-v2` | ✅ | `ggml-large-v2.bin` |
+  | `large-v3` | ✅ | `ggml-large-v3.bin` |
+  | `large-v3-turbo` | ✅ | `ggml-large-v3-turbo.bin` |
 
-- Transcribes audio from different file types such as:
-  - mp3
-  - wav
+  Plain `"large"` resolves to `large-v3`, as before. Names are matched case-insensitively and
+  tolerate a `ggml-` prefix, a `.bin` suffix, and underscores, so `"ggml-tiny.en.bin"`, `"tiny_en"`
+  and `"tiny.en"` all work.
+
+- Quantized checkpoints, fine-tunes, and anything else whisper-rs can load can be used directly by
+  handing a path to [`Transcriber::new`].
+
+- Transcribes audio from any container/codec the `symphonia` dependency is built with — including
+  mp3, wav, flac, ogg and mkv — and automatically:
+  - mixes multi-channel audio down to mono, and
+  - resamples anything that is not 16 kHz.
+
+- Returns per-segment results with timestamps, so subtitles and word timelines come for free.
 
 ## Getting started
 
-To use SimpleTranscribe-rs, simply add it to your project's `cargo.toml`:
+Add the crate to your project's `Cargo.toml`:
 
-```
+```toml
 [dependencies]
-simple_transcribe_rs = "1.0.1"
-tokio = { version = "1.35.1", features = ["full"] }
+whisper-stt = "0.0.1"
+tokio = { version = "1", features = ["full"] }
 ```
 
-Due to the nature of downloading models, it is necessary to await instantiations of the model handler. Therefore an async runtime is required.
-[Tokio](https://github.com/tokio-rs/tokio) is what is used internally in the library and has also been tested with, and therefore is the recommended runtime for this library.
+Due to the nature of downloading models, preparing them requires `.await`, so an async runtime is
+needed. [Tokio](https://github.com/tokio-rs/tokio) is what the library is developed against, and is
+the recommended runtime.
 
 ## Usage
 
-To use SimpleTranscribe-rs, the model handler first needs to be used to setup and prepare the language model. Afterwards, the transcriber can be used to
-convert audio files to text. The following snippet depicts an example of this:
-
 ```rust
-use simple_transcribe_rs::model_handler;
-use simple_transcribe_rs::transcriber;
+use whisper_stt::{ModelStore, Transcriber, WhisperModel};
 
 #[tokio::main]
-async fn main() {
-    let m = model_handler::ModelHandler::new("tiny", "models/").await;
-    let trans = transcriber::Transcriber::new(m);
-    let result = trans.transcribe("src/test_data/test.mp3", None).unwrap();
-    let text = result.get_text();
-    let start = result.get_start_timestamp();
-    let end = result.get_end_timestamp();
-    println!("start[{}]-end[{}] {}", start, end, text);
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Downloads `ggml-tiny.bin` into `models/` on first run, then reuses it.
+    let store = ModelStore::pretrained(WhisperModel::Tiny, "models");
+    store.ensure().await?;
+
+    let transcriber = Transcriber::new(store.path())?;
+    let result = transcriber.transcribe_file("assets/test.mp3", None)?;
+
+    println!("start[{}]-end[{}] {}", result.start_timestamp(), result.end_timestamp(), result.text());
+
+    for segment in result.segments() {
+        println!("  [{} ms - {} ms] {}", segment.start_ms(), segment.end_ms(), segment.text.trim());
+    }
+    Ok(())
 }
 ```
 
-The snippet can be run via:
-`cargo run --example usage_example`
+The snippet can be run via `cargo run --example usage_example`.
+
+### Choosing a language, translating, and other options
+
+```rust
+use whisper_stt::TranscriptionOptions;
+
+let options = TranscriptionOptions {
+    language: Some("zh"),   // skip auto-detection
+    translate: true,        // translate the speech into English
+    n_threads: Some(8),
+    ..TranscriptionOptions::default()
+};
+
+let result = transcriber.transcribe_file("assets/gongxifachai.mp3", Some(&options))?;
+```
+
+See `cargo run --example usage_example_chinese`.
+
+Anything not covered by `TranscriptionOptions` (grammars, callbacks, VAD, token-level DTW timestamps,
+GPU offload) stays reachable: build a `whisper_rs::FullParams` yourself and call
+`Transcriber::transcribe_with_params`, or use `Transcriber::new_with_params` to pass
+`WhisperContextParameters`.
+
+### Listing models
+
+```text
+cargo run --example models              # print the catalogue
+cargo run --example models -- tiny.en   # download one checkpoint into models/
+```
+
+## Migration from the old `model_handler` API
+
+`ModelHandler` still exists as a thin shim so existing code keeps working:
+
+```rust
+let handler = whisper_stt::model_handler::ModelHandler::new("tiny", "models/").await;
+let transcriber = Transcriber::new(handler)?;
+```
+
+Prefer moving to `ModelStore`, which is checked against the catalogue at compile time and reports
+failures instead of panicking.
+
+## License
+
+MIT

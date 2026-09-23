@@ -1,25 +1,23 @@
 [package]
-name = "whisper_stt"
-version = "0.0.0"
-edition = "2021"
+name = "whisper-stt"
+version = "0.0.1"
+edition = "2024"
 license = "MIT"
 description = "Audio to text transcription library written in rust that utilizes whisper-rs bindings."
-homepage = "https://github.com/phial3/whisper-stt"
 repository = "https://github.com/phial3/whisper-stt"
-readme = "README.md"
 keywords = ["STT", "Speech-to-text", "whisper", "openai", "transcription"]
 categories = ["multimedia::audio"]
 exclude = [".github"]
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# See more keys and their definitions at
+# https://doc.rust-lang.org/cargo/reference/manifest.html
+# https://doc.rust-lang.org/cargo/reference/environment-variables.html
 
 [dependencies]
-anyhow = "1.0"
-whisper-rs = "0.14"
-reqwest = "0.12"
-tokio = { version = "1.44", features = ["full"] }
-phf = { version = "0.11", features = ["macros"] }
-symphonia = { version = "0.5", features = ["mp3"] }
+reqwest = "0.13"
+whisper-rs = "0.16"
+tokio = { version = "1.53", features = ["full"] }
+symphonia = { version = "0.6", features = ["mp3"] }
 
 [dev-dependencies]
-hf-hub = "0.4"
-tempfile = "3.19"
+anyhow = "1"
+hf-hub = "1.0"

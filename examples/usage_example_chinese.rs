@@ -1,21 +1,36 @@
-use whisper_rs::FullParams;
-use whisper_rs::SamplingStrategy;
-use whisper_stt::model_handler::ModelHandler;
-use whisper_stt::transcriber::Transcriber;
+//! Transcribes Mandarin audio with `large-v3`, forcing the source language.
+//!
+//! `cargo run --example usage_example_chinese`
+//!
+//! Note that `large-v3` is a ~2.9 GB download. Swap in [`WhisperModel::Tiny`] for a much cheaper
+//! run with worse accuracy.
+
+use anyhow::Result;
+use whisper_stt::{ModelStore, Transcriber, TranscriptionOptions, WhisperModel};
 
 #[tokio::main]
-async fn main() {
-    let m = ModelHandler::new("large", "models/").await;
-    let trans = Transcriber::new(m);
-    let mut params = FullParams::new(SamplingStrategy::default());
-    params.set_language(Some("zh"));
+async fn main() -> Result<()> {
+    let store = ModelStore::pretrained(WhisperModel::LargeV3, "models");
+    store.ensure().await?;
 
-    let result = trans
-        .transcribe("src/test_data/gongxifachai.mp3", Some(params))
-        .unwrap();
-    // 16KHz Sample rate, Mono for language other than English is better for Whisper.
-    let text = result.get_text();
-    let start = result.get_start_timestamp();
-    let end = result.get_end_timestamp();
-    println!("start[{}]-end[{}] {}", start, end, text);
+    let transcriber = Transcriber::new(store.path())?;
+
+    // Naming the language avoids mis-detection on short clips; Whisper internally resamples to
+    // 16 kHz mono, which for non-English audio gives markedly better results.
+    let options = TranscriptionOptions {
+        language: Some("zh"),
+        ..TranscriptionOptions::default()
+    };
+
+    let result = transcriber.transcribe_file("assets/gongxifachai.mp3", Some(&options))?;
+
+    println!("detected language: {}", options.language.unwrap_or("auto"));
+    println!(
+        "start[{}]-end[{}] {}",
+        result.start_timestamp(),
+        result.end_timestamp(),
+        result.text()
+    );
+
+    Ok(())
 }

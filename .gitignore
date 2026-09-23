@@ -3,11 +3,12 @@
 /debug
 /output
 /Cargo.lock
-
-.idea
-.vscode
 .DS_Store
 
-/migrations/
+.idea/
+.zcode/
+.vscode/
+.workbuddy/
+
 /models/
 /test_models/

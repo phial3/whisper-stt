@@ -1,20 +1,22 @@
-use hf_hub::api::sync::{ApiBuilder};
-use hf_hub::Cache;
 use anyhow::{Context, Result};
+use hf_hub::{HFClient, split_id};
 
-fn main() -> Result<()> {
-    let cache_dir = std::path::Path::new("models");
-    let cache = Cache::new(cache_dir.to_path_buf());
-    let api = ApiBuilder::from_cache(cache)
-        .with_progress(true)
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = HFClient::builder()
+        .cache_dir(std::path::PathBuf::from("models"))
         .build()?;
 
-    let repo = api.model("ggerganov/whisper.cpp".to_string());
-
-    let filename = repo.get("ggml-tiny-encoder.mlmodelc.zip")
+    let (owner, name) = split_id("ggerganov/whisper.cpp");
+    let path = client
+        .model(owner, name)
+        .download_file()
+        .filename("ggml-tiny-encoder.mlmodelc.zip")
+        .send()
+        .await
         .context("Failed to download model")?;
 
-    println!("{:?}", filename.to_str());
+    println!("{:?}", path.to_str());
 
     Ok(())
 }
