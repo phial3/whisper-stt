@@ -112,6 +112,37 @@ GPU offload) stays reachable: build a `whisper_rs::FullParams` yourself and call
 `Transcriber::transcribe_with_params`, or use `Transcriber::new_with_params` to pass
 `WhisperContextParameters`.
 
+### Live translation: the whole pipeline
+
+`examples/live_translate.rs` wires every stage together: capture → denoise → resample → VAD →
+transcribe, with decoding on a worker thread so it never blocks the microphone.
+
+```text
+cargo run --example live_translate                       # auto-detect language -> English
+cargo run --example live_translate -- --model large-v3   # turbo cannot translate, see below
+cargo run --example live_translate -- --file take.wav    # run the same chain over a file
+cargo run --example live_translate -- --no-translate     # transcribe, do not translate
+cargo run --example live_translate -- --denoise          # also run RNNoise
+cargo run --example live_translate -- --out speech.wav   # keep the speech that was sent
+```
+
+Press **Enter** to start and **Enter** (or Ctrl+C) to stop. Silence closes an utterance, so the
+model only ever sees whole sentences. Utterances are measured in audio samples rather than wall
+clock, so a file run — which chews through minutes of audio in a fraction of a second — segments
+exactly like a live one does.
+
+Two findings that matter when you run it:
+
+- **Turbo checkpoints cannot translate.** They are trained on transcription data only and return
+  the source language even when the translate task is requested. Use `large-v3` (or
+  medium/small/base/tiny) for real translation into English; the example says so at startup.
+- **Denoising is opt-in** (`--denoise`). RNNoise is trained on 48 kHz wideband audio, and on this
+  crate's own test clip it preserved the level but cut a 2.8 s utterance to 0.4 s and turned a
+  correct transcript into nonsense. Compare on your own microphone before relying on it.
+
+`--file` swaps the microphone for a media file and runs the identical chain, which is how you check
+the conditioning stages without talking.
+
 ### Better resampling with rubato
 
 `whisper_stt::audio::resample` uses linear interpolation: cheap, but it lets everything above the

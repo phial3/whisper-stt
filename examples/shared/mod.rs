@@ -48,6 +48,19 @@ impl Stopper {
         Ok(Self { tx, rx })
     }
 
+    /// Starts listening for Enter on stdin without blocking.
+    ///
+    /// For loops that have to keep working while waiting (live transcription), call this once and
+    /// then [`Stopper::poll`] on every iteration.
+    pub fn start_stdin(&self) {
+        self.spawn_stdin_reader();
+    }
+
+    /// Non-blocking check: `Some(stop)` once Enter was pressed or Ctrl+C arrived.
+    pub fn poll(&self) -> Option<Stop> {
+        self.rx.try_recv().ok()
+    }
+
     /// Blocks until the user presses Enter or hits Ctrl+C.
     pub fn wait(&self) -> Stop {
         self.spawn_stdin_reader();
