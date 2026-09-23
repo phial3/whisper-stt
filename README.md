@@ -108,6 +108,38 @@ GPU offload) stays reachable: build a `whisper_rs::FullParams` yourself and call
 `Transcriber::transcribe_with_params`, or use `Transcriber::new_with_params` to pass
 `WhisperContextParameters`.
 
+### Recording the microphone
+
+Two examples capture the microphone and write a WAV file into `recordings/`. Both are **interactive**:
+
+1. Press **Enter** to start recording — Ctrl+C here aborts without writing anything.
+2. Press **Enter** again, or hit **Ctrl+C**, to stop. A live elapsed timer is printed while you talk.
+3. The capture is resampled to 16 kHz mono, written to disk, then played back on the default output
+   device. The program exits by itself once playback finishes.
+
+```text
+cargo run --example recording                    # rodio  -> recordings/rodio-<timestamp>.wav
+cargo run --example recording -- hello.wav       # rodio  -> recordings/hello.wav
+cargo run --example recording -- --list          # list the input devices rodio can see
+
+cargo run --example record_cpal                  # cpal   -> recordings/cpal-<timestamp>.wav
+cargo run --example record_cpal -- note.wav      # cpal   -> recordings/note.wav
+cargo run --example record_cpal -- --list        # list devices and every config they support
+cargo run --example record_cpal -- --transcribe  # also transcribe the take with `tiny`
+```
+
+A bare filename is resolved inside `recordings/`; any other path is used as given. The extension must
+be `.wav`.
+
+`recording.rs` uses rodio's high-level `microphone` module and asks the hardware for 16 kHz mono
+directly. `record_cpal.rs` drives cpal itself, handles every sample format the device offers, and
+always resamples through `whisper_stt::audio`. Either way the file on disk is 16 kHz mono, so it can
+be handed to `Transcriber::transcribe_file` untouched.
+
+Ctrl+C is caught by a real signal handler rather than killing the process, so a take stopped with
+Ctrl+C is still written and played back normally. On macOS the first run needs microphone permission
+for your terminal/IDE.
+
 ### Listing models
 
 ```text

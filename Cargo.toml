@@ -21,3 +21,7 @@ symphonia = { version = "0.6", features = ["mp3"] }
 [dev-dependencies]
 anyhow = "1"
 hf-hub = "1.0"
+ctrlc = "3.5"
+cpal = "0.18"
+hound = "3.5"
+rodio = "0.22"
