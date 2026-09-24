@@ -1,10 +1,14 @@
 //! High-quality sample-rate conversion with **rubato 5.0**.
 //!
-//! Whisper needs 16 kHz mono. `whisper_stt::audio::resample` gets there with cheap linear
-//! interpolation, which is fine for a first pass but leaves everything above the new Nyquist
-//! limit to alias back into the audio. rubato is what you reach for when the resampling itself
-//! matters: an FFT-based synchronous resampler and two asynchronous ones (windowed-sinc and
-//! polynomial), all of which anti-alias properly.
+//! Whisper needs 16 kHz mono, and `whisper_stt::audio::resample` gets there with rubato's
+//! FFT-based synchronous resampler — the engine this example measures. It is what the library
+//! picked because it low-passes below the destination Nyquist limit before decimating, so nothing
+//! above 8 kHz folds back into a 16 kHz clip as noise Whisper then hears as speech.
+//!
+//! rubato has heavier engines, and this example is where to compare them: a windowed-sinc
+//! asynchronous resampler and a septic-polynomial one, both slower and both steeper in the stop
+//! band. If the built-in ever turns out to be the bottleneck on your audio, run this and see what
+//! the alternatives cost.
 //!
 //! The example runs two measurements:
 //!
@@ -121,12 +125,12 @@ fn main() -> Result<()> {
         process("poly", &mut poly, &input_adapter, frames)?,
     ];
 
-    // The built-in linear resampler, for reference.
+    // The resampler the library itself uses, for reference: same algorithm, f32 instead of f64.
     let started = Instant::now();
-    let linear = resample(&mono, decoded.sample_rate, WHISPER_SAMPLE_RATE);
+    let built_in = resample(&mono, decoded.sample_rate, WHISPER_SAMPLE_RATE)?;
     takes.push(Take {
-        name: "linear (built-in)",
-        samples: linear.iter().map(|sample| *sample as f64).collect(),
+        name: "built-in",
+        samples: built_in.iter().map(|sample| *sample as f64).collect(),
         elapsed: started.elapsed(),
     });
 
@@ -137,7 +141,7 @@ fn main() -> Result<()> {
         let take = takes
             .iter()
             .find(|take| take.name == wanted)
-            .ok_or_else(|| anyhow!("unknown engine {wanted:?}; use fft, sinc or poly"))?;
+            .ok_or_else(|| anyhow!("unknown engine {wanted:?}; use fft, sinc, poly or built-in"))?;
         let samples: Vec<f32> = take.samples.iter().map(|sample| *sample as f32).collect();
         write_wav(&out, &samples, WHISPER_SAMPLE_RATE)?;
         println!(
@@ -258,12 +262,12 @@ fn alias_probe(fft: &mut Fft<f64>, sinc: &mut Async<f64>, poly: &mut Async<f64>)
         process("poly", poly, &input, frames)?,
     ];
 
-    // The linear resampler operates on f32, so round-trip the probe through it.
+    // The built-in resampler runs in f32, so round-trip the probe through it.
     let probe_f32: Vec<f32> = probe.iter().map(|sample| *sample as f32).collect();
-    let linear = resample(&probe_f32, PROBE_RATE, WHISPER_SAMPLE_RATE);
+    let built_in = resample(&probe_f32, PROBE_RATE, WHISPER_SAMPLE_RATE)?;
     takes.push(Take {
-        name: "linear (built-in)",
-        samples: linear.iter().map(|sample| *sample as f64).collect(),
+        name: "built-in",
+        samples: built_in.iter().map(|sample| *sample as f64).collect(),
         elapsed: Duration::ZERO,
     });
 
@@ -284,8 +288,8 @@ fn alias_probe(fft: &mut Fft<f64>, sinc: &mut Async<f64>, poly: &mut Async<f64>)
             format_db(level_db(&take.samples, WHISPER_SAMPLE_RATE, 6_000.0))
         );
     }
-    println!("\nThe 6 kHz column is aliasing: lower is better. Linear interpolation folds the");
-    println!("10 kHz tone straight back onto the audio, which the filtered engines suppress.");
+    println!("\nThe 6 kHz column is aliasing: lower is better. An unfiltered resample folds the");
+    println!("10 kHz tone straight back onto the audio; every engine here suppresses it instead.");
 
     Ok(())
 }

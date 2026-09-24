@@ -8,10 +8,17 @@
 //! 2. Convert that into what Whisper wants: a mono stream resampled to
 //!    [`WHISPER_SAMPLE_RATE`] ([`DecodedAudio::to_whisper_input`]).
 //!
+//! Resampling goes through rubato, which filters before it decimates. That matters more than it
+//! sounds: a naive linear interpolation folds everything above the new Nyquist limit back into the
+//! audio, and Whisper hears that folded noise as speech.
+//!
 //! Only format and codec features enabled on the `symphonia` dependency can be decoded.
 
 use std::path::Path;
 
+use rubato::FixedSync;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, Resampler};
 use symphonia::core::audio::Channels;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -22,6 +29,10 @@ use symphonia::core::meta::MetadataOptions;
 
 use crate::error::{Error, Result};
 use crate::model::WHISPER_SAMPLE_RATE;
+
+/// Frames rubato converts per call. Large enough to amortise the FFT, small enough that a
+/// ten-second clip is not one giant transform.
+const RESAMPLE_CHUNK: usize = 1_024;
 
 /// Decoded PCM audio, in the channel-interleaved layout produced by the decoder.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,9 +67,12 @@ impl DecodedAudio {
     ///
     /// Feeding anything else to Whisper produces severely degraded transcripts, so callers should
     /// always route decoder output through this method.
-    pub fn to_whisper_input(&self) -> Vec<f32> {
-        let mono = self.to_mono();
-        resample(&mono, self.sample_rate, WHISPER_SAMPLE_RATE)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Resample`] when the sample rate cannot be converted.
+    pub fn to_whisper_input(&self) -> Result<Vec<f32>> {
+        resample(&self.to_mono(), self.sample_rate, WHISPER_SAMPLE_RATE)
     }
 }
 
@@ -176,31 +190,39 @@ pub fn mix_down(samples: &[f32], channels: usize) -> Vec<f32> {
     mono
 }
 
-/// Resamples mono audio to `dst_rate` using linear interpolation.
+/// Resamples mono audio to `dst_rate`, filtering out what no longer fits.
 ///
-/// Returns the input unchanged when `src_rate == dst_rate`.
-pub fn resample(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate || src_rate == 0 || dst_rate == 0 {
-        return samples.to_vec();
-    }
-    if samples.len() < 2 {
-        return samples.to_vec();
-    }
-
-    let src_rate = src_rate as f64;
-    let dst_rate = dst_rate as f64;
-    let out_len = (samples.len() as f64 * dst_rate / src_rate).floor() as usize;
-    let mut out = Vec::with_capacity(out_len);
-
-    for i in 0..out_len {
-        let position = i as f64 * src_rate / dst_rate;
-        let left = position.floor() as usize;
-        let right = (left + 1).min(samples.len() - 1);
-        let weight = position - left as f64;
-        out.push(samples[left] + (samples[right] - samples[left]) * weight as f32);
+/// Uses rubato's FFT resampler, which is synchronous: its output length is a pure function of the
+/// input length and the two rates, and it low-passes below the destination Nyquist limit before
+/// decimating. That is what keeps a 10 kHz tone in a 24 kHz recording from reappearing as 6 kHz
+/// hiss once the audio is downsampled to 16 kHz.
+///
+/// Inputs that cannot be resampled — matching rates, an unusable rate, or fewer than two samples,
+/// which carry no frequency content to preserve — are returned unchanged.
+///
+/// # Errors
+///
+/// Returns [`Error::Resample`] if rubato rejects the rate pair or fails mid-conversion.
+pub fn resample(samples: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
+    if src_rate == dst_rate || src_rate == 0 || dst_rate == 0 || samples.len() < 2 {
+        return Ok(samples.to_vec());
     }
 
-    out
+    let mut resampler = Fft::<f32>::new(
+        src_rate as usize,
+        dst_rate as usize,
+        RESAMPLE_CHUNK,
+        1,
+        FixedSync::Input,
+    )
+    .map_err(|err| Error::Resample(format!("{src_rate} Hz -> {dst_rate} Hz: {err}")))?;
+
+    let input = InterleavedSlice::new(samples, 1, samples.len())
+        .map_err(|err| Error::Resample(err.to_string()))?;
+    resampler
+        .process_all(&input, samples.len(), None)
+        .map(|output| output.take_data())
+        .map_err(|err| Error::Resample(err.to_string()))
 }
 
 #[cfg(test)]
@@ -231,30 +253,74 @@ mod tests {
     #[test]
     fn resample_is_identity_when_rates_match() {
         let samples = vec![0.1f32, 0.2, 0.3];
-        assert_eq!(resample(&samples, 16_000, 16_000), samples);
+        assert_eq!(resample(&samples, 16_000, 16_000).unwrap(), samples);
     }
 
     #[test]
     fn resample_downscales_length() {
         let samples: Vec<f32> = (0..48_000).map(|i| i as f32).collect();
-        let resampled = resample(&samples, 48_000, WHISPER_SAMPLE_RATE);
+        let resampled = resample(&samples, 48_000, WHISPER_SAMPLE_RATE).unwrap();
         assert_eq!(resampled.len(), 16_000);
-        // The first and last taps stay anchored to the original endpoints.
-        assert_eq!(resampled[0], 0.0);
-        assert!(resampled[resampled.len() - 1] <= 48_000.0);
     }
 
     #[test]
     fn resample_upscales_length() {
         let samples = vec![0.0f32, 1.0];
-        let up = resample(&samples, 2, 4);
+        let up = resample(&samples, 2, 4).unwrap();
         assert_eq!(up.len(), 4);
     }
 
     #[test]
     fn resample_handles_tiny_inputs() {
-        assert!(resample(&[], 8_000, 16_000).is_empty());
-        assert_eq!(resample(&[0.5], 8_000, 16_000), vec![0.5]);
+        // Fewer than two samples carries no frequency content worth interpolating.
+        assert!(resample(&[], 8_000, 16_000).unwrap().is_empty());
+        assert_eq!(resample(&[0.5], 8_000, 16_000).unwrap(), vec![0.5]);
+    }
+
+    /// Magnitude of `frequency` in `samples`, in dB relative to full scale.
+    ///
+    /// Goertzel, which is a single-bin DFT: cheaper than an FFT and all a test needs.
+    fn level_db(samples: &[f32], sample_rate: u32, frequency: f64) -> f64 {
+        let bins = samples.len();
+        let omega = 2.0 * std::f64::consts::PI * frequency / sample_rate as f64;
+        let coefficient = 2.0 * omega.cos();
+        let (mut oldest, mut previous) = (0.0f64, 0.0f64);
+        for &sample in samples {
+            let current = sample as f64 + coefficient * previous - oldest;
+            oldest = previous;
+            previous = current;
+        }
+        let real = previous - oldest * omega.cos();
+        let imaginary = oldest * omega.sin();
+        let magnitude = real.hypot(imaginary) / bins as f64 * 2.0;
+        20.0 * magnitude.max(1e-12).log10()
+    }
+
+    #[test]
+    fn resample_filters_above_the_new_nyquist_limit() {
+        // A 24 kHz clip holding two tones: 3 kHz survives the move to 16 kHz, 10 kHz does not -
+        // it sits above the 8 kHz Nyquist limit and, unfiltered, folds back to 6 kHz.
+        let rate = 24_000u32;
+        let samples: Vec<f32> = (0..rate)
+            .map(|index| {
+                let t = index as f64 / rate as f64;
+                let keep = (2.0 * std::f64::consts::PI * 3_000.0 * t).sin();
+                let drop = (2.0 * std::f64::consts::PI * 10_000.0 * t).sin();
+                (0.5 * (keep + drop)) as f32
+            })
+            .collect();
+
+        let resampled = resample(&samples, rate, WHISPER_SAMPLE_RATE).unwrap();
+        let kept = level_db(&resampled, WHISPER_SAMPLE_RATE, 3_000.0);
+        let alias = level_db(&resampled, WHISPER_SAMPLE_RATE, 6_000.0);
+
+        // The tone we wanted is intact and the one we did not is at least 24 dB behind it. A
+        // linear interpolation would leave them within a few dB of each other.
+        assert!(kept > -12.0, "the 3 kHz tone was lost: {kept:.1} dB");
+        assert!(
+            alias < kept - 24.0,
+            "10 kHz aliased back into the audio: {alias:.1} dB vs {kept:.1} dB"
+        );
     }
 
     #[test]

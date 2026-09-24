@@ -23,7 +23,7 @@ fn english_mp3_decodes_to_the_expected_layout() {
 #[test]
 fn whisper_input_is_resampled_to_16khz() {
     let audio = decode("test.mp3").unwrap();
-    let samples = audio.to_whisper_input();
+    let samples = audio.to_whisper_input().unwrap();
 
     // 24 kHz -> 16 kHz downsamples by two thirds.
     let expected = audio.samples.len() * 2 / 3;
@@ -48,7 +48,7 @@ fn already_16khz_audio_passes_through() {
         sample_rate: WHISPER_SAMPLE_RATE,
         channels: 1,
     };
-    assert_eq!(audio.to_whisper_input(), samples);
+    assert_eq!(audio.to_whisper_input().unwrap(), samples);
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn multi_channel_audio_is_mixed_down() {
         channels: 2,
     };
 
-    assert_eq!(audio.to_whisper_input(), frames);
+    assert_eq!(audio.to_whisper_input().unwrap(), frames);
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn duration_survives_resampling() {
     let before = audio.duration_ms();
 
     let resampled = DecodedAudio {
-        samples: audio.to_whisper_input(),
+        samples: audio.to_whisper_input().unwrap(),
         sample_rate: WHISPER_SAMPLE_RATE,
         channels: 1,
     };

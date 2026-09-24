@@ -94,7 +94,7 @@ fn main() -> Result<()> {
     // Whisper only understands 16 kHz mono, so downmix first and resample afterwards.
     let channels = supported.channels() as usize;
     let mono = mix_down(&samples, channels);
-    let whisper_input = resample(&mono, supported.sample_rate(), WHISPER_SAMPLE_RATE);
+    let whisper_input = resample(&mono, supported.sample_rate(), WHISPER_SAMPLE_RATE)?;
 
     write_wav(&output, &whisper_input, WHISPER_SAMPLE_RATE)?;
     println!(

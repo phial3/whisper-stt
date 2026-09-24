@@ -119,7 +119,7 @@ fn main() -> Result<()> {
 
     // Whisper only understands 16 kHz mono.
     let mono = mix_down(&samples, config.channel_count.get() as usize);
-    let whisper_input = resample(&mono, config.sample_rate.get(), WHISPER_SAMPLE_RATE);
+    let whisper_input = resample(&mono, config.sample_rate.get(), WHISPER_SAMPLE_RATE)?;
 
     write_wav(&output, &whisper_input, WHISPER_SAMPLE_RATE)?;
     println!(

@@ -10,7 +10,7 @@
 //! | [`model`] | Catalogue of every Whisper checkpoint whisper-rs supports. Pure data. |
 //! | [`store`] | Where a model lives on disk, and how to fetch it. The only networked module. |
 //! | [`audio`] | Decoding media files into mono 16 kHz `f32`, what Whisper is trained on. |
-//! | [`transcriber`] | Loading a model and running it. |
+//! | [`transcriber`] | Loading a model and running it, once or in a reusable session. |
 //! | [`handler`] | Compatibility shim for the pre-refactor string-based API. |
 //!
 //! # Supported models
@@ -50,4 +50,6 @@ pub mod transcriber;
 pub use error::{Error, Result};
 pub use model::{ModelSource, WHISPER_MODELS, WHISPER_SAMPLE_RATE, WhisperModel};
 pub use store::ModelStore;
-pub use transcriber::{Segment, Transcriber, TranscriberOutput, TranscriptionOptions};
+pub use transcriber::{
+    Segment, Transcriber, TranscriberOutput, TranscriptionOptions, TranscriptionSession,
+};

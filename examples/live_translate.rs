@@ -67,7 +67,9 @@ use voice_engine::media::processor::Processor;
 use voice_engine::media::vad::{TinySilero, VADOption, VadProcessor};
 use voice_engine::media::{AudioFrame, Samples};
 use whisper_stt::audio::{decode_file, mix_down};
-use whisper_stt::{ModelStore, Transcriber, TranscriptionOptions, WHISPER_SAMPLE_RATE};
+use whisper_stt::{
+    ModelStore, Transcriber, TranscriptionOptions, TranscriptionSession, WHISPER_SAMPLE_RATE,
+};
 
 #[path = "shared/mod.rs"]
 mod shared;
@@ -172,6 +174,10 @@ fn main() -> Result<()> {
     // Decoding lives here: the model is loaded once, then fed one turn at a time.
     let (work_tx, work_rx) = channel::<Turn>();
     let worker = thread::spawn(move || {
+        // One session for the whole conversation: the state holds the KV cache and the mel and
+        // encoder buffers, and reallocating them per turn is the most expensive thing this loop
+        // could do. `TranscriptionOptions::no_context` below keeps Whisper from carrying the
+        // previous turn's text into the next one now that the state survives between turns.
         let transcriber = match Transcriber::new(&model_path) {
             Ok(transcriber) => transcriber,
             Err(err) => {
@@ -179,9 +185,16 @@ fn main() -> Result<()> {
                 return;
             }
         };
+        let mut session = match transcriber.session() {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("failed to allocate a whisper state: {err}");
+                return;
+            }
+        };
         for turn in work_rx {
             if let Err(err) = translate_turn(
-                &transcriber,
+                &mut session,
                 &turn,
                 translate,
                 show_source,
@@ -220,7 +233,7 @@ fn main() -> Result<()> {
 
 /// Decodes one turn and prints it as a line of dialogue.
 fn translate_turn(
-    transcriber: &Transcriber,
+    session: &mut TranscriptionSession<'_>,
     turn: &Turn,
     translate: bool,
     show_source: bool,
@@ -231,13 +244,13 @@ fn translate_turn(
     // `--source` costs a second decode pass, which is why it is not the default: on a large model
     // that is most of the delay a live conversation would notice.
     if show_source && translate {
-        let original = decode(transcriber, turn, language, false)?;
+        let original = decode(session, turn, language, false)?;
         if !original.is_empty() {
             println!("{} {} {}", turn.label(), source_tag(language), original);
         }
     }
 
-    let text = decode(transcriber, turn, language, translate)?;
+    let text = decode(session, turn, language, translate)?;
     if text.is_empty() {
         println!("{} (no speech found)", turn.label());
         return Ok(());
@@ -259,7 +272,7 @@ fn translate_turn(
 
 /// Runs Whisper over a turn and returns the text, whitespace and all, tidied onto one line.
 fn decode(
-    transcriber: &Transcriber,
+    session: &mut TranscriptionSession<'_>,
     turn: &Turn,
     language: Option<&str>,
     translate: bool,
@@ -275,7 +288,7 @@ fn decode(
         single_segment: turn.secs() < 10.0,
         ..TranscriptionOptions::default()
     };
-    let output = transcriber.transcribe_samples(turn.samples(), Some(&options))?;
+    let output = session.transcribe_samples(turn.samples(), Some(&options))?;
     Ok(output
         .text()
         .split_whitespace()

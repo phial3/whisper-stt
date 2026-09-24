@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     let samples = if decoded.sample_rate == WHISPER_SAMPLE_RATE {
         mono
     } else {
-        resample(&mono, decoded.sample_rate, WHISPER_SAMPLE_RATE)
+        resample(&mono, decoded.sample_rate, WHISPER_SAMPLE_RATE)?
     };
     let window = if engine == "ten" {
         TEN_WINDOW

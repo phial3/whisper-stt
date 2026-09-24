@@ -1,11 +1,33 @@
 //! Model storage: resolves where a ggml checkpoint lives and downloads it when needed.
 //!
-//! This is the only module that touches the network. It knows nothing about transcription.
+//! This is the only module that touches the network.
+//! It knows nothing about transcription.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::model::{ModelSource, WhisperModel};
+
+/// How far a model download has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// Bytes written to the staging file so far.
+    pub written: u64,
+    /// Total size of the checkpoint, when the server told us.
+    pub total: Option<u64>,
+}
+
+impl Progress {
+    /// Fraction of the download that is done, or `None` when the total size is unknown.
+    pub fn fraction(self) -> Option<f32> {
+        let total = self.total?;
+        if total == 0 {
+            return None;
+        }
+        Some((self.written as f32 / total as f32).min(1.0))
+    }
+}
 
 /// Manages the on-disk location of a Whisper model.
 ///
@@ -111,34 +133,58 @@ impl ModelStore {
 
     /// Downloads the model into the models directory and returns its path.
     ///
-    /// The file is written to a `.part` temporary alongside the destination and renamed only on
-    /// success, so an interrupted download never leaves a corrupt checkpoint behind.
+    /// The response is streamed to disk rather than buffered, so a 2.9 GB checkpoint never has to
+    /// fit in memory. The file is written to a `.part` staging file alongside the destination and
+    /// renamed only on success, so an interrupted download never leaves a corrupt checkpoint
+    /// behind.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ModelNotFound`] for [`ModelSource::File`] sources, [`Error::Download`] on
-    /// transport failures and [`Error::UnexpectedStatus`] when the repository does not answer 2xx.
+    /// Returns [`Error::ModelNotFound`] for [`ModelSource::File`] sources and for builds without
+    /// the `network` feature, [`Error::UnexpectedStatus`] when the repository does not answer 2xx,
+    /// and [`Error::Download`] or [`Error::Io`] on transport and filesystem failures.
     pub async fn download(&self) -> Result<PathBuf> {
+        self.download_with(|_| {}).await
+    }
+
+    /// Downloads the model, reporting progress as it goes.
+    ///
+    /// Call this instead of [`Self::download`] when you want to print a progress bar or abort a
+    /// download that is taking too long.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::download`].
+    pub async fn download_with(&self, mut on_progress: impl FnMut(Progress)) -> Result<PathBuf> {
         let Some(url) = self.source.download_url() else {
             return Err(Error::ModelNotFound(self.path()));
         };
 
         self.ensure_dir()?;
 
-        println!("Downloading model from: {url}");
-        let response = reqwest::get(&url).await?;
+        let mut response = reqwest::get(&url).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(Error::UnexpectedStatus { url, status });
         }
 
-        let bytes = response.bytes().await?;
-
         let destination = self.path();
         let temporary = temp_path_for(&destination);
-        std::fs::write(&temporary, &bytes)?;
-        std::fs::rename(&temporary, &destination)?;
+        let mut file = std::fs::File::create(&temporary)?;
+        let total = response.content_length();
+        let mut written = 0u64;
 
+        // One chunk at a time: the checkpoint is far larger than anyone's spare RAM.
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk)?;
+            written += chunk.len() as u64;
+            on_progress(Progress { written, total });
+        }
+        file.flush()?;
+        // Some platforms refuse to rename an open file.
+        drop(file);
+
+        std::fs::rename(&temporary, &destination)?;
         Ok(destination)
     }
 }
@@ -209,5 +255,27 @@ mod tests {
         let store = ModelStore::file("/tmp/does-not-exist.bin", "models");
         assert!(store.source().download_url().is_none());
         assert!(!store.exists());
+    }
+
+    #[test]
+    fn progress_fraction_is_clamped_and_total_aware() {
+        let known = Progress {
+            written: 500,
+            total: Some(1_000),
+        };
+        assert_eq!(known.fraction(), Some(0.5));
+
+        // A server that omits Content-Length leaves the fraction unknown rather than zero.
+        let unknown = Progress {
+            written: 500,
+            total: None,
+        };
+        assert_eq!(unknown.fraction(), None);
+
+        let empty = Progress {
+            written: 0,
+            total: Some(0),
+        };
+        assert_eq!(empty.fraction(), None);
     }
 }

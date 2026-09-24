@@ -38,6 +38,8 @@ pub enum Error {
     NoAudioTrack,
     /// The audio file decoded to zero samples.
     EmptyAudio,
+    /// Converting audio to the sample rate Whisper needs failed.
+    Resample(String),
     /// Translation to English was requested but the loaded model is English-only.
     TranslationUnsupported,
 }
@@ -60,6 +62,7 @@ impl fmt::Display for Error {
             Error::Audio(msg) => write!(f, "audio decoding failed: {msg}"),
             Error::NoAudioTrack => write!(f, "the media file has no audio track"),
             Error::EmptyAudio => write!(f, "the audio file decoded to zero samples"),
+            Error::Resample(msg) => write!(f, "resampling failed: {msg}"),
             Error::TranslationUnsupported => write!(
                 f,
                 "translation requires a multilingual model, the loaded model is English-only"

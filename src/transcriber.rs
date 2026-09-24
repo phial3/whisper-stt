@@ -8,7 +8,6 @@ use whisper_rs::{
 
 use crate::audio::{self, DecodedAudio};
 use crate::error::{Error, Result};
-use crate::model::WHISPER_SAMPLE_RATE;
 
 /// One transcribed chunk of speech, as produced by Whisper.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,34 +103,13 @@ impl TranscriberOutput {
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
-
-    /// Start of the first segment, in Whisper's 10 ms units.
-    ///
-    /// Retained for source compatibility with releases that did not expose the segment list.
-    pub fn get_start_timestamp(&self) -> &i64 {
-        &self.start_timestamp
-    }
-
-    /// End of the last segment, in Whisper's 10 ms units.
-    ///
-    /// Retained for source compatibility with releases that did not expose the segment list.
-    pub fn get_end_timestamp(&self) -> &i64 {
-        &self.end_timestamp
-    }
-
-    /// Concatenated text of every segment.
-    ///
-    /// Retained for source compatibility; prefer [`Self::text`].
-    pub fn get_text(&self) -> &str {
-        &self.text
-    }
 }
 
 /// High-level transcription settings.
 ///
 /// All defaults are Whisper's own defaults. Construct one, tweak the fields you care about, and pass
 /// it to [`Transcriber::transcribe_file`]; for anything not covered here, build a
-/// [`whisper_rs::FullParams`] by hand and use [`Transcriber::transcribe_with_params`].
+/// [`whisper_rs::FullParams`] by hand and use [`TranscriptionSession::transcribe_samples_with_params`].
 #[derive(Debug, Clone)]
 pub struct TranscriptionOptions<'a> {
     /// Force a source language (`"en"`, `"zh"`, `"auto"`, ...) instead of letting Whisper detect it.
@@ -228,6 +206,10 @@ impl TranscriptionOptions<'_> {
 
 /// A loaded Whisper model, ready to transcribe audio.
 ///
+/// Each `transcribe_*` call creates a Whisper state, runs it, and drops it again. That is the safe
+/// default and costs nothing for a handful of files; for a loop that runs the same model over and
+/// over, take a [`TranscriptionSession`] and reuse one state instead.
+///
 /// ```no_run
 /// # fn example() -> whisper_stt::Result<()> {
 /// use whisper_stt::Transcriber;
@@ -245,8 +227,7 @@ pub struct Transcriber {
 impl Transcriber {
     /// Loads a Whisper model from disk.
     ///
-    /// Accepts anything path-like: a `&str`, a `PathBuf`, a [`crate::ModelStore`], or the legacy
-    /// [`crate::handler::ModelHandler`].
+    /// Accepts anything path-like: a `&str`, a `PathBuf`, or a [`crate::ModelStore`].
     ///
     /// # Errors
     ///
@@ -285,9 +266,34 @@ impl Transcriber {
         self.ctx.n_text_ctx()
     }
 
+    /// Opens a session that reuses a single Whisper state for every transcription.
+    ///
+    /// Creating a state allocates the KV cache plus the mel and encoder buffers — hundreds of
+    /// megabytes on the large checkpoints — and whisper.cpp redoes that work on every call. A
+    /// session pays for it once.
+    ///
+    /// # Text context carries over
+    ///
+    /// Whisper feeds the text it already produced back in as a prompt for what comes next. With a
+    /// fresh state that history starts empty; with a reused state it survives from one call to the
+    /// next, and only [`TranscriptionOptions::no_context`] clears it. That is what you want when
+    /// feeding one long recording in order, and the opposite of what you want when every call is
+    /// an independent utterance — set `no_context: true` for a live-transcription loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Whisper`] if whisper.cpp cannot allocate the state.
+    pub fn session(&self) -> Result<TranscriptionSession<'_>> {
+        Ok(TranscriptionSession {
+            model: self,
+            state: self.create_state()?,
+        })
+    }
+
     /// Transcribes an audio file, decoding it and resampling it to what Whisper expects.
     ///
-    /// `options` may be `None` to use [`TranscriptionOptions::default`].
+    /// Convenience wrapper: opens a throwaway session, runs it, drops it. See
+    /// [`Self::session`] for the reusable variant.
     ///
     /// # Errors
     ///
@@ -298,24 +304,105 @@ impl Transcriber {
         audio_path: P,
         options: Option<&TranscriptionOptions<'_>>,
     ) -> Result<TranscriberOutput> {
+        self.session()?.transcribe_file(audio_path, options)
+    }
+
+    /// Transcribes already-decoded audio in a throwaway session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Resample`] if the audio cannot be resampled, and [`Error::Whisper`] if the
+    /// model fails to run.
+    pub fn transcribe_decoded(
+        &self,
+        audio: &DecodedAudio,
+        options: Option<&TranscriptionOptions<'_>>,
+    ) -> Result<TranscriberOutput> {
+        self.session()?.transcribe_decoded(audio, options)
+    }
+
+    /// Transcribes raw audio samples in a throwaway session.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`TranscriptionSession::transcribe_samples`].
+    pub fn transcribe_samples(
+        &self,
+        samples: &[f32],
+        options: Option<&TranscriptionOptions<'_>>,
+    ) -> Result<TranscriberOutput> {
+        self.session()?.transcribe_samples(samples, options)
+    }
+
+    /// Creates a Whisper state bound to this context.
+    fn create_state(&self) -> Result<WhisperState> {
+        self.ctx
+            .create_state()
+            .map_err(|_| Error::Whisper(whisper_rs::WhisperError::FailedToCreateState))
+    }
+}
+
+/// A [`Transcriber`] bound to one reusable Whisper state.
+///
+/// Created by [`Transcriber::session`]. Prefer it over calling `Transcriber::transcribe_*` in a
+/// loop: the state is allocated once instead of per call. Read [`Transcriber::session`] for what
+/// reusing a state means for text context.
+///
+/// ```no_run
+/// # fn example() -> whisper_stt::Result<()> {
+/// use whisper_stt::Transcriber;
+///
+/// let transcriber = Transcriber::new("models/ggml-tiny.bin")?;
+/// let mut session = transcriber.session()?;
+/// for chunk in ["one.wav", "two.wav"] {
+///     let output = session.transcribe_file(chunk, None)?;
+///     println!("{}", output.text());
+/// }
+/// # Ok(()) }
+/// ```
+#[derive(Debug)]
+pub struct TranscriptionSession<'model> {
+    model: &'model Transcriber,
+    state: WhisperState,
+}
+
+impl<'model> TranscriptionSession<'model> {
+    /// The transcriber this session runs on.
+    pub fn model(&self) -> &'model Transcriber {
+        self.model
+    }
+
+    /// Transcribes an audio file, decoding it and resampling it to what Whisper expects.
+    ///
+    /// `options` may be `None` to use [`TranscriptionOptions::default`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Audio`] if the file cannot be decoded, [`Error::Resample`] if it cannot be
+    /// resampled to 16 kHz, and [`Error::Whisper`] if the model fails to run.
+    pub fn transcribe_file<P: AsRef<Path>>(
+        &mut self,
+        audio_path: P,
+        options: Option<&TranscriptionOptions<'_>>,
+    ) -> Result<TranscriberOutput> {
         let audio = audio::decode_file(audio_path)?;
         self.transcribe_decoded(&audio, options)
     }
 
     /// Transcribes already-decoded audio.
     ///
-    /// Useful when the same file is transcribed several times, or when samples come from a
-    /// microphone rather than a file.
+    /// Useful when samples come from a microphone rather than a file.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Whisper`] if the model fails to run.
+    /// Returns [`Error::Resample`] if the audio cannot be resampled to 16 kHz, and
+    /// [`Error::Whisper`] if the model fails to run.
     pub fn transcribe_decoded(
-        &self,
+        &mut self,
         audio: &DecodedAudio,
         options: Option<&TranscriptionOptions<'_>>,
     ) -> Result<TranscriberOutput> {
-        let samples = audio.to_whisper_input();
+        let samples = audio.to_whisper_input()?;
         self.transcribe_samples(&samples, options)
     }
 
@@ -330,7 +417,7 @@ impl Transcriber {
     /// translation is requested for an English-only model, and [`Error::Whisper`] if the model
     /// fails to run.
     pub fn transcribe_samples(
-        &self,
+        &mut self,
         samples: &[f32],
         options: Option<&TranscriptionOptions<'_>>,
     ) -> Result<TranscriberOutput> {
@@ -341,53 +428,43 @@ impl Transcriber {
         let default_options = TranscriptionOptions::default();
         let options = options.unwrap_or(&default_options);
 
-        if options.translate && !self.is_multilingual() {
+        if options.translate && !self.model.is_multilingual() {
             return Err(Error::TranslationUnsupported);
         }
 
-        let mut state = self.create_state()?;
-        state.full(options.to_full_params(), samples)?;
-
-        self.collect_output(&state)
+        self.state.full(options.to_full_params(), samples)?;
+        self.collect()
     }
 
-    /// Transcribes an audio file with hand-built [`FullParams`].
+    /// Transcribes raw audio samples with hand-built [`FullParams`].
     ///
     /// Escape hatch for everything [`TranscriptionOptions`] does not cover (grammars, callbacks,
     /// token-level timestamps, VAD, ...).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Audio`] if the file cannot be decoded and [`Error::Whisper`] if the model
-    /// fails to run.
-    pub fn transcribe_with_params<P: AsRef<Path>>(
-        &self,
-        audio_path: P,
+    /// Returns [`Error::EmptyAudio`] for an empty slice and [`Error::Whisper`] if the model fails
+    /// to run.
+    pub fn transcribe_samples_with_params(
+        &mut self,
+        samples: &[f32],
         params: FullParams<'_, '_>,
     ) -> Result<TranscriberOutput> {
-        let audio = audio::decode_file(audio_path)?;
-        let samples = audio.to_whisper_input();
-
-        let mut state = self.create_state()?;
-        state.full(params, &samples)?;
-
-        self.collect_output(&state)
+        if samples.is_empty() {
+            return Err(Error::EmptyAudio);
+        }
+        self.state.full(params, samples)?;
+        self.collect()
     }
 
-    /// Creates a Whisper state bound to this context.
-    fn create_state(&self) -> Result<WhisperState> {
-        self.ctx
-            .create_state()
-            .map_err(|_| Error::Whisper(whisper_rs::WhisperError::FailedToCreateState))
-    }
-
-    /// Collects every segment Whisper produced for `state`.
-    fn collect_output(&self, state: &WhisperState) -> Result<TranscriberOutput> {
+    /// Collects every segment Whisper produced in the last run.
+    fn collect(&self) -> Result<TranscriberOutput> {
         let mut text = String::new();
         let mut segments = Vec::new();
 
-        for index in 0..state.full_n_segments() {
-            let segment = state
+        for index in 0..self.state.full_n_segments() {
+            let segment = self
+                .state
                 .get_segment(index)
                 .ok_or(Error::Whisper(whisper_rs::WhisperError::NullPointer))?;
 
@@ -418,9 +495,6 @@ impl Transcriber {
         })
     }
 }
-
-/// Sample rate [`Transcriber::transcribe_samples`] expects, in Hz.
-pub const EXPECTED_SAMPLE_RATE: u32 = WHISPER_SAMPLE_RATE;
 
 #[cfg(test)]
 mod tests {
@@ -494,9 +568,6 @@ mod tests {
         assert_eq!(output.text(), " a b");
         // The reported probability is the worst segment's, not an average.
         assert!((output.no_speech_probability() - 0.42).abs() < f32::EPSILON);
-        assert_eq!(output.get_text(), " a b");
-        assert_eq!(*output.get_start_timestamp(), 0);
-        assert_eq!(*output.get_end_timestamp(), 250);
     }
 
     #[test]
