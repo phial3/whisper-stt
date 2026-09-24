@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::model::WHISPER_SAMPLE_RATE;
 
 /// One transcribed chunk of speech, as produced by Whisper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
     /// Start of the segment, in Whisper's 10 ms units (multiply by 10 to get milliseconds).
     pub start_timestamp: i64,
@@ -19,6 +19,14 @@ pub struct Segment {
     pub end_timestamp: i64,
     /// Transcribed text for this segment, including its leading space if Whisper emitted one.
     pub text: String,
+    /// How sure Whisper is that this segment holds no speech at all, between 0 and 1.
+    ///
+    /// Whisper happily invents text over silence, noise and music — the well-known "thank you for
+    /// watching" on an empty room. This is the model's own opinion on whether the segment was
+    /// speech. How much it can be trusted depends on the checkpoint: it separates clean speech from
+    /// silence on the classic multilingual models, and stays near zero for everything on the turbo
+    /// ones. Gate on it only after checking what it actually reports for your model.
+    pub no_speech_probability: f32,
 }
 
 impl Segment {
@@ -37,7 +45,7 @@ impl Segment {
 ///
 /// Beside the full text, the individual Whisper segments are kept so callers can build subtitles or
 /// word-level timelines without re-running the model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TranscriberOutput {
     /// Concatenated text of every segment.
     pub text: String,
@@ -56,6 +64,20 @@ impl TranscriberOutput {
     /// Individual segments, in the order Whisper produced them.
     pub fn segments(&self) -> &[Segment] {
         &self.segments
+    }
+
+    /// Highest no-speech probability across the segments, or 1.0 when nothing was decoded.
+    ///
+    /// A one-line guard against invented text — see [`Segment::no_speech_probability`] for how much
+    /// weight it carries for a given checkpoint.
+    pub fn no_speech_probability(&self) -> f32 {
+        if self.segments.is_empty() {
+            return 1.0;
+        }
+        self.segments
+            .iter()
+            .map(|segment| segment.no_speech_probability)
+            .fold(0.0, f32::max)
     }
 
     /// Start of the first segment, in Whisper's 10 ms units.
@@ -125,6 +147,28 @@ pub struct TranscriptionOptions<'a> {
     pub print_progress: bool,
     /// Emit special tokens (segment markers, `<|Novalidate|>`, etc.).
     pub print_special: bool,
+    /// Do not reuse the previous window's text as context for the next one.
+    ///
+    /// Leave this off when transcribing one long recording. Turn it on when every call is an
+    /// independent utterance — a live-transcription loop, say — otherwise Whisper carries the tail
+    /// of the previous sentence into the new one and both come out wrong.
+    pub no_context: bool,
+    /// Force the whole input into a single segment instead of splitting it on timestamps.
+    ///
+    /// Short utterances (a few seconds) often confuse Whisper's timestamp logic, which shows up as
+    /// text being dropped or repeated. One segment is the right shape for a single utterance.
+    pub single_segment: bool,
+    /// Suppress tokens that the model considers non-speech.
+    ///
+    /// This is what stops Whisper from inventing text over silence, noise, or music — the classic
+    /// "thank you for watching" on an empty room. It needs token-level timestamps internally, which
+    /// this option enables on its own.
+    pub suppress_non_speech: bool,
+    /// Probability above which a window is declared silence and produces no text.
+    ///
+    /// `None` keeps Whisper's default (0.6). Raise it to be stricter about what counts as speech;
+    /// lower it if short, quiet utterances come back empty.
+    pub no_speech_threshold: Option<f32>,
     /// Number of threads to use. `None` lets whisper.cpp pick.
     pub n_threads: Option<i32>,
     /// Optional prompt prepended to the first window, useful for steering spelling and vocabulary.
@@ -139,6 +183,10 @@ impl Default for TranscriptionOptions<'_> {
             sampling: SamplingStrategy::Greedy { best_of: 1 },
             print_progress: false,
             print_special: false,
+            no_context: false,
+            single_segment: false,
+            suppress_non_speech: false,
+            no_speech_threshold: None,
             n_threads: None,
             initial_prompt: None,
         }
@@ -158,6 +206,16 @@ impl TranscriptionOptions<'_> {
         params.set_print_progress(self.print_progress);
         params.set_print_special(self.print_special);
         params.set_language(self.language);
+        params.set_no_context(self.no_context);
+        params.set_single_segment(self.single_segment);
+        // whisper.cpp only has the per-token probabilities this needs when token timestamps are on.
+        if self.suppress_non_speech {
+            params.set_token_timestamps(true);
+            params.set_suppress_nst(true);
+        }
+        if let Some(threshold) = self.no_speech_threshold {
+            params.set_no_speech_thold(threshold);
+        }
         if let Some(threads) = self.n_threads {
             params.set_n_threads(threads);
         }
@@ -336,12 +394,14 @@ impl Transcriber {
             let start_timestamp = segment.start_timestamp();
             let end_timestamp = segment.end_timestamp();
             let segment_text = segment.to_str_lossy()?.into_owned();
+            let no_speech_probability = segment.no_speech_probability();
 
             text.push_str(&segment_text);
             segments.push(Segment {
                 start_timestamp,
                 end_timestamp,
                 text: segment_text,
+                no_speech_probability,
             });
         }
 
@@ -396,6 +456,7 @@ mod tests {
             start_timestamp: 0,
             end_timestamp: 320,
             text: " hello".into(),
+            no_speech_probability: 0.1,
         };
         assert_eq!(segment.start_ms(), 0);
         assert_eq!(segment.end_ms(), 3_200);
@@ -410,11 +471,13 @@ mod tests {
                     start_timestamp: 0,
                     end_timestamp: 100,
                     text: " a".into(),
+                    no_speech_probability: 0.05,
                 },
                 Segment {
                     start_timestamp: 100,
                     end_timestamp: 250,
                     text: " b".into(),
+                    no_speech_probability: 0.42,
                 },
             ],
             start_timestamp: 0,
@@ -429,6 +492,8 @@ mod tests {
         assert_eq!(output.len(), 2);
         assert!(!output.is_empty());
         assert_eq!(output.text(), " a b");
+        // The reported probability is the worst segment's, not an average.
+        assert!((output.no_speech_probability() - 0.42).abs() < f32::EPSILON);
         assert_eq!(output.get_text(), " a b");
         assert_eq!(*output.get_start_timestamp(), 0);
         assert_eq!(*output.get_end_timestamp(), 250);
@@ -445,5 +510,7 @@ mod tests {
         assert!(output.is_empty());
         assert_eq!(output.duration_ms(), 0);
         assert_eq!(output.segments().len(), 0);
+        // Nothing decoded at all is as silent as it gets.
+        assert_eq!(output.no_speech_probability(), 1.0);
     }
 }

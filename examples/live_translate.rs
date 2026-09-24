@@ -1,15 +1,15 @@
-//! Live translation: microphone → denoise → resample → VAD → Whisper → English text.
+//! Live translation as a conversation: microphone → denoise → resample → voice activity → Whisper.
 //!
-//! The whole crate's pipeline in one loop, and the reason each piece exists:
+//! Every stage exists because skipping it breaks the transcript:
 //!
 //! 1. **Capture** — rodio's microphone, asked for 16 kHz mono (hardware usually gives 44.1/48 kHz).
 //! 2. **Denoise** — `voice-engine`'s `NoiseReducer` (RNNoise) runs on the device-rate audio.
 //! 3. **Resample** — rubato 5.0 resamples to the 16 kHz Whisper requires, in real time. A naive
-//!    linear resample would fold everything above 8 kHz back into the audio, which is exactly what
-//!    makes a transcript fall apart.
-//! 4. **VAD** — `voice-engine`'s Silero port decides which windows are speech, so silence is never
-//!    sent to the model. Whisper hallucinates filler text on silence; feeding it whole utterances
-//!    instead of a raw stream is what keeps the output clean.
+//!    linear resample folds everything above 8 kHz back into the audio, which is exactly what makes
+//!    a transcript fall apart.
+//! 4. **Segment** — `voice-engine`'s `VadProcessor` (a Silero port plus the padding logic around
+//!    it) decides where a turn starts and ends. This is the stage that keeps the output clean:
+//!    Whisper *invents* text when it is handed silence, and a pause of quiet is what closes a turn.
 //! 5. **Transcribe + translate** — `whisper-stt` with `translate: true`, on a worker thread so
 //!    decoding never blocks capture.
 //!
@@ -19,7 +19,9 @@
 //! cargo run --example live_translate -- --model tiny       # quick smoke test
 //! cargo run --example live_translate -- --model large-v3   # turbo cannot translate, see below
 //! cargo run --example live_translate -- --no-translate     # transcribe, do not translate
+//! cargo run --example live_translate -- --source           # show what was said, not just the result
 //! cargo run --example live_translate -- --denoise          # also run RNNoise
+//! cargo run --example live_translate -- --pause 3000       # wait 3s of quiet before translating
 //! cargo run --example live_translate -- --out speech.wav   # keep the speech that was sent
 //! ```
 //!
@@ -32,9 +34,9 @@
 //!   test clip it preserved the level but cut a 2.8 s utterance down to 0.4 s and turned a correct
 //!   transcript into nonsense. Pass `--denoise` to enable it and compare on your own microphone.
 //!
-//! Press **Enter** to start and **Enter** (or Ctrl+C) to stop. Say a full sentence, pause, and it
-//! comes back translated. This is not low latency: Whisper decodes each utterance after you finish
-//! it, so expect a pause of a second or two per segment, longer for the bigger models.
+//! Press **Enter** to start and **Enter** (or Ctrl+C) to stop. Say a full sentence, pause, and the
+//! turn comes back translated. This is not low latency: Whisper decodes each turn after you finish
+//! it, so expect a pause of a second or two, longer for the bigger models.
 //!
 //! `--file` swaps the microphone for a media file and runs it through the identical chain, which is
 //! how you check the conditioning stages without having to talk:
@@ -43,7 +45,6 @@
 //! cargo run --example live_translate -- --file recordings/rodio-1790179654.wav
 //! ```
 
-use std::collections::VecDeque;
 use std::num::NonZero;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,9 +60,11 @@ use rubato::{
     Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
+use tokio::sync::broadcast;
+use voice_engine::event::SessionEvent;
 use voice_engine::media::denoiser::NoiseReducer;
 use voice_engine::media::processor::Processor;
-use voice_engine::media::vad::{TinySilero, VADOption};
+use voice_engine::media::vad::{TinySilero, VADOption, VadProcessor};
 use voice_engine::media::{AudioFrame, Samples};
 use whisper_stt::audio::{decode_file, mix_down};
 use whisper_stt::{ModelStore, Transcriber, TranscriptionOptions, WHISPER_SAMPLE_RATE};
@@ -74,21 +77,36 @@ use shared::{Stop, Stopper, write_wav};
 const PREFERRED_SAMPLE_RATE: NonZero<u32> = NonZero::new(16_000).expect("non-zero");
 const PREFERRED_CHANNELS: NonZero<u16> = NonZero::new(1).expect("non-zero");
 
-/// Frames rubato consumes per call at the device rate — about 11 ms at 44.1 kHz.
+/// Frames rubato consumes per call, measured at the device rate — about 11 ms at 44.1 kHz.
 const RESAMPLE_CHUNK: usize = 512;
-/// Frames the Silero port consumes per call: 32 ms at 16 kHz.
+/// Frames per voice-activity decision: 32 ms at 16 kHz, and Silero's own hop size.
 const VAD_WINDOW: usize = 512;
 /// Speech probability above which a window counts as voice.
 const VAD_THRESHOLD: f32 = 0.5;
-
-/// Silence this long closes an utterance and sends it to the model.
-const SILENCE_TIMEOUT: Duration = Duration::from_millis(500);
-/// An utterance is cut here even without a pause, so decoding stays bounded.
-const MAX_UTTERANCE: Duration = Duration::from_secs(20);
-/// Anything shorter than this is dropped as a cough or a click.
-const MIN_UTTERANCE: Duration = Duration::from_millis(300);
+/// Default quiet time that closes a turn, in milliseconds.
+const DEFAULT_PAUSE_MS: u64 = 2_000;
+/// A turn shorter than this is a cough or a click, not a sentence.
+const MIN_SPEECH_MS: u64 = 500;
 /// Audio kept before speech onset so the first word is not clipped.
-const PRE_ROLL: Duration = Duration::from_millis(250);
+///
+/// Silero is an LSTM: after a long silence it needs a window or two to ramp up, so the frame it
+/// first calls speech can be several hundred milliseconds into the sentence. Keeping a third of a
+/// second of lead-in is what gets the opening syllable back.
+const PRE_ROLL_MS: usize = 350;
+/// Quiet audio appended after a turn so the last word is not cut off mid-syllable.
+const TAIL_PAD_MS: usize = 300;
+/// Fraction of a turn that has to look like speech before it is worth decoding.
+///
+/// The voice detector can open a turn on a door slam and then hear nothing until the pause closes
+/// it. That turn is almost entirely silence, and Whisper will invent a confident sentence for it.
+const MIN_SPEECH_RATIO: f32 = 0.4;
+/// Longest turn the segmenter is allowed to hold on to.
+///
+/// Somebody who never pauses would otherwise produce one endless turn that never reaches the model.
+/// The ceiling is 25s rather than Whisper's own 30s window because `voice-engine` keeps a ring of
+/// the last 1000 detector windows — 32s of audio — and silently drops everything older than 5s once
+/// it overflows. Staying under 1000 windows keeps the whole turn intact.
+const MAX_UTTERANCE_SECS: u64 = 25;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -102,10 +120,18 @@ fn main() -> Result<()> {
         .to_string();
     let language = flag(&args, "--language").map(str::to_string);
     let translate = !args.iter().any(|arg| arg == "--no-translate");
+    // A second decode pass, to show what was said alongside what it means.
+    let show_source = args.iter().any(|arg| arg == "--source");
     // Opt-in: see the note in `run_session`. RNNoise runs at the device rate.
     let denoise = args.iter().any(|arg| arg == "--denoise");
     let file = flag(&args, "--file").map(PathBuf::from);
     let out = flag(&args, "--out").map(PathBuf::from);
+    let pause_ms = match flag(&args, "--pause") {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| anyhow!("--pause expects milliseconds, got {value:?}"))?,
+        None => DEFAULT_PAUSE_MS,
+    };
 
     // Whisper needs a model before it can do anything; this downloads on first run.
     let store = ModelStore::from_name(&model, "models")
@@ -143,8 +169,8 @@ fn main() -> Result<()> {
         producer: capture,
     } = source;
 
-    // Decoding lives here: the model is loaded once, then fed one utterance at a time.
-    let (work_tx, work_rx) = channel::<Vec<f32>>();
+    // Decoding lives here: the model is loaded once, then fed one turn at a time.
+    let (work_tx, work_rx) = channel::<Turn>();
     let worker = thread::spawn(move || {
         let transcriber = match Transcriber::new(&model_path) {
             Ok(transcriber) => transcriber,
@@ -153,26 +179,15 @@ fn main() -> Result<()> {
                 return;
             }
         };
-        for samples in work_rx {
-            let options = TranscriptionOptions {
-                language: language.as_deref(),
+        for turn in work_rx {
+            if let Err(err) = translate_turn(
+                &transcriber,
+                &turn,
                 translate,
-                ..TranscriptionOptions::default()
-            };
-            let started = Instant::now();
-            match transcriber.transcribe_samples(&samples, Some(&options)) {
-                Ok(output) => {
-                    let text = output.text().trim();
-                    if !text.is_empty() {
-                        println!(
-                            "  → {}  ({:.1}s of audio, decoded in {:.1?})",
-                            text,
-                            samples.len() as f32 / WHISPER_SAMPLE_RATE as f32,
-                            started.elapsed()
-                        );
-                    }
-                }
-                Err(err) => eprintln!("  ! transcription failed: {err}"),
+                show_source,
+                language.as_deref(),
+            ) {
+                eprintln!("  ! transcription failed: {err}");
             }
         }
     });
@@ -187,6 +202,7 @@ fn main() -> Result<()> {
             channels,
             denoise,
         },
+        pause_ms,
         out,
     )?;
 
@@ -196,16 +212,119 @@ fn main() -> Result<()> {
     let _ = worker.join();
 
     println!(
-        "\nStopped. {:.1}s captured, {} utterance(s) sent to the model.",
-        session.captured_secs, session.utterances
+        "\nStopped. {:.1}s captured, {} turn(s) sent to the model, {} dropped as not speech.",
+        session.captured_secs, session.turns, session.dropped
     );
     Ok(())
+}
+
+/// Decodes one turn and prints it as a line of dialogue.
+fn translate_turn(
+    transcriber: &Transcriber,
+    turn: &Turn,
+    translate: bool,
+    show_source: bool,
+    language: Option<&str>,
+) -> Result<()> {
+    let started = Instant::now();
+
+    // `--source` costs a second decode pass, which is why it is not the default: on a large model
+    // that is most of the delay a live conversation would notice.
+    if show_source && translate {
+        let original = decode(transcriber, turn, language, false)?;
+        if !original.is_empty() {
+            println!("{} {} {}", turn.label(), source_tag(language), original);
+        }
+    }
+
+    let text = decode(transcriber, turn, language, translate)?;
+    if text.is_empty() {
+        println!("{} (no speech found)", turn.label());
+        return Ok(());
+    }
+    let tag = if translate {
+        "en "
+    } else {
+        source_tag(language)
+    };
+    println!("{} {tag} {text}", turn.label());
+    println!(
+        "{:>8}  ({:.1}s of audio, decoded in {:.1?})",
+        "",
+        turn.secs(),
+        started.elapsed()
+    );
+    Ok(())
+}
+
+/// Runs Whisper over a turn and returns the text, whitespace and all, tidied onto one line.
+fn decode(
+    transcriber: &Transcriber,
+    turn: &Turn,
+    language: Option<&str>,
+    translate: bool,
+) -> Result<String> {
+    let options = TranscriptionOptions {
+        language,
+        translate,
+        // Every turn is its own sentence: without this Whisper drags the tail of the previous one
+        // into the new one and mangles both.
+        no_context: true,
+        // Whisper's timestamp splitting can drop or repeat text in the first few seconds; past ten
+        // seconds it is better off splitting.
+        single_segment: turn.secs() < 10.0,
+        ..TranscriptionOptions::default()
+    };
+    let output = transcriber.transcribe_samples(turn.samples(), Some(&options))?;
+    Ok(output
+        .text()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+/// What to call the untranslated line: the language we forced, or `you` when we did not force one.
+fn source_tag(language: Option<&str>) -> &'static str {
+    match language {
+        Some("zh") => "zh ",
+        Some("en") => "en ",
+        Some("ja") => "ja ",
+        Some("ko") => "ko ",
+        Some("fr") => "fr ",
+        Some("de") => "de ",
+        Some("es") => "es ",
+        Some("ru") => "ru ",
+        _ => "you",
+    }
+}
+
+/// One utterance on its way to the model, plus where it came from.
+struct Turn {
+    samples: Vec<f32>,
+    /// Where in the audio the turn ended, in seconds.
+    at_secs: f32,
+}
+
+impl Turn {
+    fn secs(&self) -> f32 {
+        self.samples.len() as f32 / WHISPER_SAMPLE_RATE as f32
+    }
+
+    fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
+    /// `[mm:ss]`, the way a transcript timestamps a line.
+    fn label(&self) -> String {
+        stamp(self.at_secs)
+    }
 }
 
 /// Totals for the closing line.
 struct Session {
     captured_secs: f32,
-    utterances: usize,
+    turns: usize,
+    dropped: usize,
 }
 
 /// Where the audio comes from. Both sources look identical downstream: a channel of device-rate,
@@ -320,13 +439,14 @@ struct Conditioning {
     denoise: bool,
 }
 
-/// The live loop: drain capture, condition the audio, hand utterances to the worker.
+/// The live loop: drain capture, condition the audio, hand turns to the worker.
 fn run_session(
     samples: Receiver<Vec<f32>>,
     stopper: &Stopper,
     stop_flag: &Arc<AtomicBool>,
-    work: &Sender<Vec<f32>>,
+    work: &Sender<Turn>,
     conditioning: Conditioning,
+    pause_ms: u64,
     out: Option<PathBuf>,
 ) -> Result<Session> {
     let Conditioning {
@@ -352,34 +472,24 @@ fn run_session(
         None
     };
     let mut resampler = LiveResampler::new(device_rate, WHISPER_SAMPLE_RATE)?;
-    let mut vad = TinySilero::new(VADOption {
-        samplerate: WHISPER_SAMPLE_RATE,
-        voice_threshold: VAD_THRESHOLD,
-        ..Default::default()
-    })
-    .map_err(|err| anyhow!("cannot start the VAD: {err}"))?;
+    let mut segmenter = Segmenter::new(pause_ms)?;
 
-    // All segmentation is measured in 16 kHz samples, not wall-clock time: a file mode run
-    // processes minutes of audio in a fraction of a second, and even a live run should not change
-    // its mind because the CPU stalled.
-    let silence_samples = samples_for(SILENCE_TIMEOUT);
-    let max_samples = samples_for(MAX_UTTERANCE);
-    let min_samples = samples_for(MIN_UTTERANCE);
-    let pre_roll_samples = samples_for(PRE_ROLL);
-
+    let mut emitter = Emitter {
+        work,
+        spoken: Vec::new(),
+        pre_roll: Vec::new(),
+        turns: 0,
+        dropped: 0,
+    };
     let mut pending_16k: Vec<f32> = Vec::new();
-    let mut pre_roll: VecDeque<f32> = VecDeque::new();
-    let mut utterance: Vec<f32> = Vec::new();
-    let mut in_utterance = false;
-    let mut silence_run = 0usize;
-    let mut sent: Vec<f32> = Vec::new();
-
     let mut processed = 0usize;
-    let mut utterances = 0usize;
     let mut captured = 0usize;
 
     stopper.start_stdin();
-    println!("\nListening — press Enter or Ctrl+C to stop.\n");
+    println!(
+        "\nListening — {:.1}s of quiet ends a turn. Press Enter or Ctrl+C to stop.\n",
+        pause_ms as f32 / 1_000.0
+    );
 
     loop {
         if let Some(stop) = stopper.poll() {
@@ -424,40 +534,24 @@ fn run_session(
             }
         }
 
-        // Score whole VAD windows; a partial window waits for the next chunk.
+        // Score whole windows; a partial window waits for the next chunk.
         while pending_16k.len() >= VAD_WINDOW {
-            let window: Vec<f32> = pending_16k.drain(..VAD_WINDOW).collect();
+            let at_secs = (processed + VAD_WINDOW) as f32 / WHISPER_SAMPLE_RATE as f32;
+            emitter.keep_pre_roll(&pending_16k[..VAD_WINDOW]);
+            let turns = segmenter.feed(&pending_16k[..VAD_WINDOW])?;
+            pending_16k.drain(..VAD_WINDOW);
             processed += VAD_WINDOW;
 
-            if vad.predict(&window) > VAD_THRESHOLD {
-                if !in_utterance {
-                    // Seed with the audio just before onset, or the first word arrives clipped.
-                    utterance.extend(pre_roll.drain(..));
-                    in_utterance = true;
-                }
-                utterance.extend_from_slice(&window);
-                silence_run = 0;
-            } else if in_utterance {
-                silence_run += VAD_WINDOW;
-            } else {
-                pre_roll.extend(window.iter().copied());
-                while pre_roll.len() > pre_roll_samples {
-                    pre_roll.pop_front();
-                }
-            }
-
-            let settled = in_utterance && silence_run >= silence_samples;
-            let too_long = utterance.len() >= max_samples;
-            if settled || too_long {
-                utterances += flush(&mut utterance, &mut sent, work, processed, min_samples)?;
-                in_utterance = false;
-                silence_run = 0;
+            for speech in turns {
+                emitter.emit(speech, at_secs)?;
             }
         }
 
-        // Only stop once everything that arrived has been scored, or a trailing utterance
-        // would be thrown away.
+        // Only stop once everything that arrived has been scored, or a trailing turn is lost.
         if finished {
+            for speech in segmenter.finish()? {
+                emitter.emit(speech, processed as f32 / WHISPER_SAMPLE_RATE as f32)?;
+            }
             println!("\nEnd of audio.");
             break;
         }
@@ -467,11 +561,6 @@ fn run_session(
         }
     }
 
-    // The audio can end mid-utterance; that one still deserves to be decoded.
-    if in_utterance {
-        utterances += flush(&mut utterance, &mut sent, work, processed, min_samples)?;
-    }
-
     stop_flag.store(true, Ordering::SeqCst);
     // Drain whatever the device already delivered, so the total is honest.
     while let Ok(chunk) = samples.try_recv() {
@@ -479,56 +568,284 @@ fn run_session(
     }
 
     if let Some(out) = out {
-        if sent.is_empty() {
+        if emitter.spoken.is_empty() {
             println!("No speech captured, nothing written.");
         } else {
-            write_wav(&out, &sent, WHISPER_SAMPLE_RATE)?;
+            write_wav(&out, &emitter.spoken, WHISPER_SAMPLE_RATE)?;
             println!(
                 "Wrote {} — {:.1}s of speech at {WHISPER_SAMPLE_RATE} Hz.",
                 out.display(),
-                sent.len() as f32 / WHISPER_SAMPLE_RATE as f32
+                emitter.spoken.len() as f32 / WHISPER_SAMPLE_RATE as f32
             );
         }
     }
 
     Ok(Session {
         captured_secs: captured as f32 / (device_rate * channels as u32) as f32,
-        utterances,
+        turns: emitter.turns,
+        dropped: emitter.dropped,
     })
 }
 
-/// Converts a duration to 16 kHz frames.
-fn samples_for(duration: Duration) -> usize {
-    (duration.as_secs_f32() * WHISPER_SAMPLE_RATE as f32) as usize
+/// `[mm:ss]` for a position given in seconds.
+fn stamp(at_secs: f32) -> String {
+    let whole = at_secs as u32;
+    format!("[{:02}:{:02}]", whole / 60, whole % 60)
 }
 
-/// Closes the current utterance: keeps it if it is long enough, and sends it for decoding.
-///
-/// Returns how many utterances were actually sent.
-fn flush(
-    utterance: &mut Vec<f32>,
-    sent: &mut Vec<f32>,
-    work: &Sender<Vec<f32>>,
-    processed: usize,
-    min_samples: usize,
-) -> Result<usize> {
-    if utterance.len() < min_samples {
-        utterance.clear();
-        return Ok(0);
+/// Milliseconds to 16 kHz frames.
+fn ms_to_samples(ms: usize) -> usize {
+    ms * WHISPER_SAMPLE_RATE as usize / 1_000
+}
+
+/// Hands finished turns to the worker, and decides which ones are worth sending.
+struct Emitter<'a> {
+    work: &'a Sender<Turn>,
+    /// Every turn that was sent, concatenated — what `--out` writes.
+    spoken: Vec<f32>,
+    /// The last [`PRE_ROLL_MS`] of audio, oldest sample first.
+    pre_roll: Vec<f32>,
+    turns: usize,
+    dropped: usize,
+}
+
+impl Emitter<'_> {
+    /// Keeps the tail of `window` so a turn can start with the audio just before its onset.
+    fn keep_pre_roll(&mut self, window: &[f32]) {
+        self.pre_roll.extend_from_slice(window);
+        let limit = ms_to_samples(PRE_ROLL_MS);
+        if self.pre_roll.len() > limit {
+            self.pre_roll.drain(..self.pre_roll.len() - limit);
+        }
     }
 
-    println!(
-        "[{:6.1}s] utterance of {:.1}s",
-        processed as f32 / WHISPER_SAMPLE_RATE as f32,
-        utterance.len() as f32 / WHISPER_SAMPLE_RATE as f32
-    );
-    sent.extend_from_slice(utterance);
-    if work.send(std::mem::take(utterance)).is_err() {
-        // The worker is gone; keep going rather than dying mid-session.
-        utterance.clear();
-        return Ok(0);
+    /// Scores one finished turn, then sends it or explains why it was dropped.
+    fn emit(&mut self, speech: Vec<f32>, at_secs: f32) -> Result<()> {
+        if let Err(why) = accept(&speech)? {
+            self.dropped += 1;
+            println!("{} skipped — {why}", stamp(at_secs));
+            return Ok(());
+        }
+
+        // The turn as Whisper will hear it: a little lead-in so the first syllable is not clipped,
+        // the turn itself, and a little quiet so the last one is not cut off.
+        let mut turn = self.pre_roll.clone();
+        turn.extend_from_slice(&speech);
+        turn.extend(std::iter::repeat_n(0.0, ms_to_samples(TAIL_PAD_MS)));
+
+        self.spoken.extend_from_slice(&turn);
+        if self
+            .work
+            .send(Turn {
+                samples: turn,
+                at_secs,
+            })
+            .is_err()
+        {
+            // The worker is gone; keep going rather than dying mid-session.
+            return Ok(());
+        }
+        self.turns += 1;
+        println!(
+            "{} heard {:.1}s",
+            stamp(at_secs),
+            speech.len() as f32 / WHISPER_SAMPLE_RATE as f32
+        );
+        Ok(())
     }
-    Ok(1)
+}
+
+/// Decides whether a finished turn is worth decoding.
+///
+/// Everything here already looked like speech to the segmenter once. The question is whether it
+/// kept looking like speech: a door slam can open a turn that is then silence until the pause
+/// closes it, and Whisper turns silence into confident nonsense. Short turns are just as bad —
+/// half a second of anything is not enough for Whisper to hear a sentence in it.
+fn accept(speech: &[f32]) -> Result<std::result::Result<(), String>> {
+    let seconds = speech.len() as f32 / WHISPER_SAMPLE_RATE as f32;
+    if speech.len() < ms_to_samples(MIN_SPEECH_MS as usize) {
+        return Ok(Err(format!("only {seconds:.2}s of audio")));
+    }
+
+    let windows = speech.len() / VAD_WINDOW;
+    let voiced = count_voiced(speech)?;
+    let ratio = voiced as f32 / windows as f32;
+    if ratio < MIN_SPEECH_RATIO {
+        return Ok(Err(format!("only {:.0}% of it is speech", ratio * 100.0)));
+    }
+    Ok(Ok(()))
+}
+
+/// How many windows of `speech` a fresh voice detector calls speech.
+///
+/// A second opinion rather than a memory of the detector that opened the turn: this one only ever
+/// sees the finished utterance, so it cannot be fooled by whatever triggered the onset.
+fn count_voiced(speech: &[f32]) -> Result<usize> {
+    let mut vad = TinySilero::new(VADOption {
+        samplerate: WHISPER_SAMPLE_RATE,
+        voice_threshold: VAD_THRESHOLD,
+        ..Default::default()
+    })
+    .map_err(|err| anyhow!("cannot start the verification detector: {err}"))?;
+
+    let mut voiced = 0usize;
+    for window in speech.chunks(VAD_WINDOW) {
+        if window.len() == VAD_WINDOW && vad.predict(window) > VAD_THRESHOLD {
+            voiced += 1;
+        }
+    }
+    Ok(voiced)
+}
+
+/// Milliseconds covered by one detector window.
+const WINDOW_MS: u64 = VAD_WINDOW as u64 * 1_000 / WHISPER_SAMPLE_RATE as u64;
+
+/// Turns a stream of 16 kHz audio into finished utterances.
+///
+/// Wraps `voice-engine`'s `VadProcessor`, which owns the part that is easy to get wrong — how much
+/// quiet closes a turn, how long a turn has to be to count, and how to keep the audio in between
+/// intact. Removing the pauses inside a turn sounds like a good idea and is not: gluing speech
+/// windows together hands Whisper time-compressed audio with a click at every join.
+///
+/// Two things this adds on top:
+///
+/// - **A closing feed.** The detector only closes a turn once it has *seen* enough quiet, so when
+///   the audio runs out we feed it the silence it is waiting for rather than losing the last turn.
+/// - **A length limit.** Somebody who never pauses would otherwise produce one endless turn that
+///   never reaches the model at all.
+struct Segmenter {
+    processor: VadProcessor,
+    events: broadcast::Receiver<SessionEvent>,
+    /// Position of the frame being fed, in milliseconds.
+    ///
+    /// The segmenter measures its padding in milliseconds, and using the audio clock rather than
+    /// the wall clock keeps `--file` runs — which decode minutes in a second — behaving exactly
+    /// like live ones.
+    clock_ms: u64,
+    /// When the turn currently being spoken started, in milliseconds.
+    open_since_ms: Option<u64>,
+    pause_ms: u64,
+}
+
+impl Segmenter {
+    fn new(pause_ms: u64) -> Result<Self> {
+        let option = VADOption {
+            samplerate: WHISPER_SAMPLE_RATE,
+            voice_threshold: VAD_THRESHOLD,
+            // Minimum length of a turn, in ms.
+            speech_padding: MIN_SPEECH_MS,
+            // Quiet time that closes a turn, in ms.
+            silence_padding: pause_ms,
+            max_buffer_duration_secs: MAX_UTTERANCE_SECS,
+            ..Default::default()
+        };
+        let (events_tx, events_rx) = broadcast::channel(64);
+        let processor = VadProcessor::new(
+            Box::new(
+                TinySilero::new(option.clone())
+                    .map_err(|err| anyhow!("cannot start the voice detector: {err}"))?,
+            ),
+            events_tx,
+            option,
+        )
+        .map_err(|err| anyhow!("cannot start the segmenter: {err}"))?;
+
+        Ok(Self {
+            processor,
+            events: events_rx,
+            clock_ms: 0,
+            open_since_ms: None,
+            pause_ms,
+        })
+    }
+
+    /// Feeds 16 kHz mono audio and returns every turn that closed because of it.
+    fn feed(&mut self, window: &[f32]) -> Result<Vec<Vec<f32>>> {
+        for hop in window.chunks(VAD_WINDOW) {
+            self.push(hop)?;
+        }
+
+        let mut turns = self.take_turns();
+        // Somebody mid-monologue never gives us the pause we are waiting for, so impose one.
+        if self.open_too_long() {
+            turns.extend(self.close_open_turn()?);
+        }
+        Ok(turns)
+    }
+
+    /// Hands one detector window to the segmenter.
+    fn push(&mut self, hop: &[f32]) -> Result<()> {
+        let pcm: Vec<i16> = hop
+            .iter()
+            .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect();
+        let length = pcm.len();
+        let mut frame = AudioFrame {
+            track_id: "mic".to_string(),
+            samples: Samples::PCM { samples: pcm },
+            timestamp: self.clock_ms,
+            sample_rate: WHISPER_SAMPLE_RATE,
+        };
+        self.clock_ms += length as u64 * 1_000 / WHISPER_SAMPLE_RATE as u64;
+        self.processor
+            .process_frame(&mut frame)
+            .map_err(|err| anyhow!("voice detection failed: {err}"))
+    }
+
+    /// Whether the turn being spoken has passed [`MAX_UTTERANCE_SECS`].
+    fn open_too_long(&self) -> bool {
+        self.open_since_ms
+            .is_some_and(|since| self.clock_ms.saturating_sub(since) >= MAX_UTTERANCE_SECS * 1_000)
+    }
+
+    /// Closes whatever turn is still open by feeding it the quiet it is waiting for.
+    ///
+    /// The detector has to *see* the whole pause before it lets go, and it keeps calling speech
+    /// speech for a window or two after the audio actually stops, so a fixed length of silence is
+    /// not enough — feed one window at a time until the turn comes out, with a bound so a stuck
+    /// detector cannot spin here forever.
+    fn close_open_turn(&mut self) -> Result<Vec<Vec<f32>>> {
+        let quiet = vec![0.0f32; VAD_WINDOW];
+        let limit = self.pause_ms / WINDOW_MS + 8;
+        for _ in 0..limit {
+            self.push(&quiet)?;
+            let turns = self.take_turns();
+            if !turns.is_empty() {
+                return Ok(turns);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Feeds the silence that closes a turn and returns the last turn of the audio.
+    fn finish(&mut self) -> Result<Vec<Vec<f32>>> {
+        if self.open_since_ms.is_none() {
+            return Ok(Vec::new());
+        }
+        self.close_open_turn()
+    }
+
+    /// Takes the utterances that closed since the last call, and tracks the one still open.
+    fn take_turns(&mut self) -> Vec<Vec<f32>> {
+        let mut turns = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                SessionEvent::Speaking { start_time, .. } => self.open_since_ms = Some(start_time),
+                SessionEvent::Silence {
+                    samples: Some(pcm), ..
+                } => {
+                    self.open_since_ms = None;
+                    turns.push(
+                        pcm.iter()
+                            .map(|sample| *sample as f32 / i16::MAX as f32)
+                            .collect(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        turns
+    }
 }
 
 /// Runs RNNoise over one chunk of device-rate audio.

@@ -114,24 +114,47 @@ GPU offload) stays reachable: build a `whisper_rs::FullParams` yourself and call
 
 ### Live translation: the whole pipeline
 
-`examples/live_translate.rs` wires every stage together: capture → denoise → resample → VAD →
-transcribe, with decoding on a worker thread so it never blocks the microphone.
+`examples/live_translate.rs` wires every stage together: capture → denoise → resample → voice
+activity → transcribe, with decoding on a worker thread so it never blocks the microphone. Output
+comes back one line per turn, like a transcript:
+
+```text
+[00:06] heard 2.9s
+[00:06] zh  你叫什么名字?
+[00:15] heard 2.8s
+[00:15] zh  你叫什么名字?
+```
 
 ```text
 cargo run --example live_translate                       # auto-detect language -> English
 cargo run --example live_translate -- --model large-v3   # turbo cannot translate, see below
 cargo run --example live_translate -- --file take.wav    # run the same chain over a file
 cargo run --example live_translate -- --no-translate     # transcribe, do not translate
+cargo run --example live_translate -- --source           # show what was said, not just the result
+cargo run --example live_translate -- --pause 3000       # wait 3s of quiet, not 2s
 cargo run --example live_translate -- --denoise          # also run RNNoise
 cargo run --example live_translate -- --out speech.wav   # keep the speech that was sent
 ```
 
-Press **Enter** to start and **Enter** (or Ctrl+C) to stop. Silence closes an utterance, so the
-model only ever sees whole sentences. Utterances are measured in audio samples rather than wall
-clock, so a file run — which chews through minutes of audio in a fraction of a second — segments
-exactly like a live one does.
+Press **Enter** to start and **Enter** (or Ctrl+C) to stop. **2 seconds of quiet ends a turn**
+(`--pause` changes it), and turns are measured in audio samples rather than wall clock, so a file
+run — which chews through minutes of audio in a fraction of a second — segments exactly like a live
+one does.
 
-Two findings that matter when you run it:
+The voice-activity stage is `voice-engine`'s `VadProcessor`, not hand-rolled glue, and it is the one
+that keeps the transcript honest. Whisper does not say "I heard nothing" — give it silence and it
+confidently invents a sentence. On this crate's own test clip, half a second of quiet came back as
+*请不吝点赞 订阅 转发 打赏支持明镜与点点栏目*. Nothing in Whisper's own settings stops that
+(`suppress_nst`, `no_speech_thold` and friends all left it intact), so the fix has to be upstream:
+
+- a turn is closed by 2 s of quiet, and must be at least 500 ms long;
+- a turn whose windows are mostly *not* speech is dropped with a `skipped` line;
+- the audio between onset and offset is kept whole. Gluing only the speech windows together — the
+  obvious "optimisation" — hands Whisper time-compressed audio with a click at every join;
+- each turn gets a third of a second of lead-in and 300 ms of trailing quiet, because Silero needs a
+  window or two to let go of what it was hearing.
+
+Three findings that matter when you run it:
 
 - **Turbo checkpoints cannot translate.** They are trained on transcription data only and return
   the source language even when the translate task is requested. Use `large-v3` (or
@@ -139,6 +162,9 @@ Two findings that matter when you run it:
 - **Denoising is opt-in** (`--denoise`). RNNoise is trained on 48 kHz wideband audio, and on this
   crate's own test clip it preserved the level but cut a 2.8 s utterance to 0.4 s and turned a
   correct transcript into nonsense. Compare on your own microphone before relying on it.
+- **A turn is capped at 25 s.** `voice-engine` keeps a ring of the last 1000 detector windows and
+  drops everything older than 5 s once it overflows, so a monologue that never pauses is cut
+  deliberately rather than silently truncated.
 
 `--file` swaps the microphone for a media file and runs the identical chain, which is how you check
 the conditioning stages without talking.
