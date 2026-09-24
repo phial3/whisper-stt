@@ -1,25 +1,34 @@
-name: Deployment
+name: Publish
 
 on:
   push:
-    tags: [ "v*" ]
+    tags: ["v*"]
 
 env:
   CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+  CARGO_TERM_COLOR: always
 
 jobs:
-  Deploy:
-    name: Deploy-Crate
+  publish:
+    name: Publish to crates.io
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - name: bump-cargo-version
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref }}
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `Cargo.toml` is the source of truth for the version; the tag may only confirm it, so a
+      # forgotten version bump fails loudly here instead of silently publishing the old release.
+      - name: Check the tag matches Cargo.toml
         run: |
-          sed -i "s/0.0.0/${RELEASE_TAG##*/\v}/g" Cargo.toml
-      - name: dry-run
-        run: cargo publish --dry-run --allow-dirty
-      - name: publish
-        run: cargo publish --allow-dirty
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "tag v$tag, Cargo.toml $version"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - name: Test
+        run: cargo test --all-targets
+      - name: Package
+        run: cargo publish --dry-run
+      - name: Publish
+        run: cargo publish

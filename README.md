@@ -60,7 +60,7 @@ Add the crate to your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-whisper-stt = "0.0.1"
+whisper-stt = "0.1"
 ```
 
 Nothing in the library starts a thread or a runtime. Preparing a model is async, so it needs
@@ -89,7 +89,7 @@ Pick the audio formats you need and drop the rest; every codec is a separate fla
 
 ```toml
 # WAV in, no downloader, no TLS stack in the binary.
-whisper-stt = { version = "0.0.1", default-features = false, features = ["wav", "pcm"] }
+whisper-stt = { version = "0.1", default-features = false, features = ["wav", "pcm"] }
 ```
 
 ## Usage
@@ -249,6 +249,8 @@ built-in                -6.0 dB      < -120 dB
 that can drift, `Async::new_poly` when CPU matters more than the filter. rubato 5.0 works on
 `audioadapter` buffers, so the input is wrapped in an `InterleavedSlice` and read back through the
 `Adapter` trait.
+
+`cargo bench` measures the same path in samples per second.
 
 ### Cutting silence before transcribing
 
