@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     // Naming the language avoids mis-detection on short clips. Audio is resampled to 16 kHz mono
     // (see WHISPER_SAMPLE_RATE) before it reaches the model, which matters most for non-English.
     let options = TranscriptionOptions {
-        language: Some("zh"),
+        language: Some("zh".into()),
         ..TranscriptionOptions::default()
     };
 
@@ -53,7 +53,10 @@ async fn main() -> Result<()> {
 
     println!("model:   {}", store.source().file_name());
     println!("sample rate expected: {WHISPER_SAMPLE_RATE} Hz mono");
-    println!("language: {}", options.language.unwrap_or("auto"));
+    println!(
+        "language: {}",
+        options.language.as_deref().unwrap_or("auto")
+    );
     println!(
         "start[{}]-end[{}] {}",
         result.start_timestamp(),

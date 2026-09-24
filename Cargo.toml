@@ -7,17 +7,64 @@ description = "Audio to text transcription library written in rust that utilizes
 repository = "https://github.com/phial3/whisper-stt"
 keywords = ["STT", "Speech-to-text", "whisper", "openai", "transcription"]
 categories = ["multimedia::audio"]
-exclude = [".github"]
+exclude = [".github", "models", "recordings"]
 # See more keys and their definitions at
 # https://doc.rust-lang.org/cargo/reference/manifest.html
 # https://doc.rust-lang.org/cargo/reference/environment-variables.html
 
+[features]
+default = [
+    "network",
+    "mp3",
+    "aac",
+    "flac",
+    "vorbis",
+    "ogg",
+    "mkv",
+    "isomp4",
+    "wav",
+    "pcm",
+    "metadata",
+]
+
+## Enables `ModelStore::ensure` and `ModelStore::download`: fetches checkpoints over HTTPS.
+## Turn it off to drop reqwest and its TLS stack when models ship with the binary.
+network = ["dep:reqwest"]
+
+## MPEG-1/2/3 audio (`.mp3`).
+mp3 = ["symphonia/mp3"]
+## Advanced Audio Coding (`.aac`), usually inside `.m4a` or `.mp4`.
+aac = ["symphonia/aac"]
+## Free Lossless Audio Codec (`.flac`).
+flac = ["symphonia/flac"]
+## Vorbis audio.
+vorbis = ["symphonia/vorbis"]
+## Ogg container (`.ogg`, `.oga`).
+ogg = ["symphonia/ogg"]
+## Matroska / WebM container (`.mkv`, `.mka`, `.webm`).
+mkv = ["symphonia/mkv"]
+## ISO Base Media container (`.mp4`, `.m4a`, `.mov`).
+isomp4 = ["symphonia/isomp4"]
+## Uncompressed PCM, as stored in WAV, AIFF and CAF.
+pcm = ["symphonia/pcm"]
+## RIFF WAVE container (`.wav`).
+wav = ["symphonia/wav"]
+## Audio Interchange File Format (`.aiff`).
+aiff = ["symphonia/aiff"]
+## Core Audio Format (`.caf`).
+caf = ["symphonia/caf"]
+## Apple Lossless (`.alac`).
+alac = ["symphonia/alac"]
+## Adaptive Differential PCM.
+adpcm = ["symphonia/adpcm"]
+## ID3v1, ID3v2 and APE tag readers.
+metadata = ["symphonia/all-meta"]
+
 [dependencies]
-reqwest = "0.13"
 whisper-rs = "0.16"
-tokio = { version = "1.53", features = ["full"] }
-symphonia = { version = "0.6", features = ["mp3"] }
 rubato = "5.0"
+reqwest = { version = "0.13", optional = true }
+symphonia = { version = "0.6", default-features = false, features = ["opt-simd"] }
 
 [dev-dependencies]
 anyhow = "1"
@@ -27,6 +74,7 @@ cpal = "0.18"
 hound = "3.5"
 rodio = "0.22"
 voice-engine = "0.3"
+tokio = { version = "1.53", features = ["full"] }
 # Blocked: `flexaudio` 0.2 depends on `cpal` 0.16, whose ALSA backend pulls in
 # `alsa-sys`, and cargo will not let two packages claim the same `links = "alsa"`
 # in one graph. Revisit once flexaudio moves to cpal 0.18 (or drop our cpal dep).

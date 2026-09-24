@@ -1,10 +1,12 @@
 //! Model storage: resolves where a ggml checkpoint lives and downloads it when needed.
 //!
-//! This is the only module that touches the network.
+//! This is the only module that touches the network, and only when the `network` feature is on.
 //! It knows nothing about transcription.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "network")]
+use std::io::Write as _;
 
 use crate::error::{Error, Result};
 use crate::model::{ModelSource, WhisperModel};
@@ -160,32 +162,45 @@ impl ModelStore {
             return Err(Error::ModelNotFound(self.path()));
         };
 
-        self.ensure_dir()?;
+        #[cfg(feature = "network")]
+        {
+            self.ensure_dir()?;
 
-        let mut response = reqwest::get(&url).await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::UnexpectedStatus { url, status });
+            let mut response = reqwest::get(&url).await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(Error::UnexpectedStatus {
+                    url,
+                    status: status.as_u16(),
+                });
+            }
+
+            let destination = self.path();
+            let temporary = temp_path_for(&destination);
+            let mut file = std::fs::File::create(&temporary)?;
+            let total = response.content_length();
+            let mut written = 0u64;
+
+            // One chunk at a time: the checkpoint is far larger than anyone's spare RAM.
+            while let Some(chunk) = response.chunk().await? {
+                file.write_all(&chunk)?;
+                written += chunk.len() as u64;
+                on_progress(Progress { written, total });
+            }
+            file.flush()?;
+            // Some platforms refuse to rename an open file.
+            drop(file);
+
+            std::fs::rename(&temporary, &destination)?;
+            Ok(destination)
         }
 
-        let destination = self.path();
-        let temporary = temp_path_for(&destination);
-        let mut file = std::fs::File::create(&temporary)?;
-        let total = response.content_length();
-        let mut written = 0u64;
-
-        // One chunk at a time: the checkpoint is far larger than anyone's spare RAM.
-        while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk)?;
-            written += chunk.len() as u64;
-            on_progress(Progress { written, total });
+        #[cfg(not(feature = "network"))]
+        {
+            // Silence the unused-binding warning; the URL is still what `ensure` would fetch.
+            let _ = (&url, &mut on_progress);
+            Err(Error::ModelNotFound(self.path()))
         }
-        file.flush()?;
-        // Some platforms refuse to rename an open file.
-        drop(file);
-
-        std::fs::rename(&temporary, &destination)?;
-        Ok(destination)
     }
 }
 
@@ -196,6 +211,7 @@ impl AsRef<Path> for ModelStore {
 }
 
 /// Returns `<destination>.part`, used as the staging file for downloads.
+#[cfg(feature = "network")]
 fn temp_path_for(destination: &Path) -> PathBuf {
     let mut file_name = destination
         .file_name()
@@ -239,6 +255,7 @@ mod tests {
         assert_eq!(store.path(), PathBuf::from("/tmp/ggml-custom.bin"));
     }
 
+    #[cfg(feature = "network")]
     #[test]
     fn temp_path_appends_part() {
         let destination = PathBuf::from("models/ggml-tiny.bin");

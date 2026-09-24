@@ -242,6 +242,28 @@ impl WhisperModel {
         }
     }
 
+    /// The checkpoint a whisper-rs DTW alignment preset refers to.
+    ///
+    /// The inverse of [`Self::dtw_preset`]. The match is exhaustive on purpose: the moment
+    /// whisper-rs adds a checkpoint to `DtwModelPreset`, this stops compiling instead of leaving
+    /// the catalogue quietly one model short.
+    pub const fn from_dtw_preset(preset: DtwModelPreset) -> Self {
+        match preset {
+            DtwModelPreset::Tiny => WhisperModel::Tiny,
+            DtwModelPreset::TinyEn => WhisperModel::TinyEn,
+            DtwModelPreset::Base => WhisperModel::Base,
+            DtwModelPreset::BaseEn => WhisperModel::BaseEn,
+            DtwModelPreset::Small => WhisperModel::Small,
+            DtwModelPreset::SmallEn => WhisperModel::SmallEn,
+            DtwModelPreset::Medium => WhisperModel::Medium,
+            DtwModelPreset::MediumEn => WhisperModel::MediumEn,
+            DtwModelPreset::LargeV1 => WhisperModel::LargeV1,
+            DtwModelPreset::LargeV2 => WhisperModel::LargeV2,
+            DtwModelPreset::LargeV3 => WhisperModel::LargeV3,
+            DtwModelPreset::LargeV3Turbo => WhisperModel::LargeV3Turbo,
+        }
+    }
+
     /// Resolves a user-supplied model name to a checkpoint.
     ///
     /// Matching is case-insensitive and tolerant: a leading `ggml-`, a trailing `.bin`,
@@ -285,11 +307,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalogue_matches_dtw_presets() {
+    fn catalogue_round_trips_dtw_presets() {
         // Every model whisper-rs can align against must be present in the catalogue, otherwise the
-        // two lists silently drift apart.
+        // two lists silently drift apart. `from_dtw_preset` matching exhaustively is what turns
+        // that drift into a compile error rather than a missing entry.
         for model in WhisperModel::all() {
-            let _ = model.dtw_preset();
+            assert_eq!(WhisperModel::from_dtw_preset(model.dtw_preset()), *model);
         }
         assert_eq!(WhisperModel::all().len(), 12);
     }

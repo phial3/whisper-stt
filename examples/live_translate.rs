@@ -278,7 +278,7 @@ fn decode(
     translate: bool,
 ) -> Result<String> {
     let options = TranscriptionOptions {
-        language,
+        language: language.map(str::to_string),
         translate,
         // Every turn is its own sentence: without this Whisper drags the tail of the previous one
         // into the new one and mangles both.

@@ -41,15 +41,18 @@ their projects quickly 🌩️
   handing a path to [`Transcriber::new`].
 
 - Transcribes audio from any container/codec the `symphonia` dependency is built with — including
-  mp3, wav, flac, ogg and mkv — and automatically:
+  mp3, wav, flac, ogg, mkv, mp4 and m4a — and automatically:
   - mixes multi-channel audio down to mono, and
-  - resamples anything that is not 16 kHz.
+  - resamples anything that is not 16 kHz through an FFT resampler that anti-aliases properly.
 
 - Returns per-segment results with timestamps, so subtitles and word timelines come for free.
 
+- Reuses one Whisper state across transcriptions when you ask it to, instead of reallocating the
+  model's buffers on every call.
+
 - Ships runnable examples for the whole pipeline: `recording` / `record_cpal` capture the microphone
-  interactively, `resample` compares high-quality resamplers (`rubato`), and `vad` cuts silence out
-  before transcribing with an offline neural VAD (`voice-engine`).
+  interactively, `resample` compares resampler engines (`rubato`), and `vad` cuts silence out before
+  transcribing with an offline neural VAD (`voice-engine`).
 
 ## Getting started
 
@@ -58,12 +61,36 @@ Add the crate to your project's `Cargo.toml`:
 ```toml
 [dependencies]
 whisper-stt = "0.0.1"
-tokio = { version = "1", features = ["full"] }
 ```
 
-Due to the nature of downloading models, preparing them requires `.await`, so an async runtime is
-needed. [Tokio](https://github.com/tokio-rs/tokio) is what the library is developed against, and is
-the recommended runtime.
+Nothing in the library starts a thread or a runtime. Preparing a model is async, so it needs
+whatever runtime your application already runs on —
+[Tokio](https://github.com/tokio-rs/tokio) is what this crate is developed and tested against:
+
+```toml
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+### Feature flags
+
+Pick the audio formats you need and drop the rest; every codec is a separate flag.
+
+| Feature | Default | Enables |
+|---|---|---|
+| `network` | ✅ | `ModelStore::ensure` / `download`, via reqwest |
+| `mp3` | ✅ | MPEG audio |
+| `aac` | ✅ | AAC, as found in `.m4a` and `.mp4` |
+| `flac` | ✅ | FLAC |
+| `vorbis`, `ogg` | ✅ | Vorbis and the Ogg container |
+| `mkv`, `isomp4` | ✅ | Matroska/WebM and MP4/MOV containers |
+| `wav`, `pcm` | ✅ | Uncompressed PCM and the WAVE container |
+| `metadata` | ✅ | ID3v1, ID3v2 and APE tag readers |
+| `aiff`, `caf`, `alac`, `adpcm` | ❌ | The remaining Symphonia codecs |
+
+```toml
+# WAV in, no downloader, no TLS stack in the binary.
+whisper-stt = { version = "0.0.1", default-features = false, features = ["wav", "pcm"] }
+```
 
 ## Usage
 
@@ -90,14 +117,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The snippet can be run via `cargo run --example usage_example`.
 
+### Reusing one Whisper state
+
+`Transcriber::transcribe_*` creates a Whisper state, runs it, and throws it away. Creating a state
+allocates the KV cache and the mel, encoder and decoder buffers — on `large-v3-turbo`, whisper.cpp
+reports ~357 MB of it, and it redoes the work on every call. For a loop, ask for a session:
+
+```rust
+let transcriber = Transcriber::new("models/ggml-large-v3-turbo.bin")?;
+let mut session = transcriber.session()?;
+
+for path in ["take-1.wav", "take-2.wav", "take-3.wav"] {
+    let result = session.transcribe_file(path, None)?;
+    println!("{}", result.text());
+}
+```
+
+Whisper feeds the text it has already produced back in as a prompt for what comes next, and a reused
+state keeps that history between calls. That is what you want when you are reading one long recording
+in order, and the opposite of what you want when every call is a separate utterance — set
+`no_context: true` in that case, which is what `live_translate` does.
+
 ### Choosing a language, translating, and other options
 
 ```rust
 use whisper_stt::TranscriptionOptions;
 
 let options = TranscriptionOptions {
-    language: Some("zh"),   // skip auto-detection
-    translate: true,        // translate the speech into English
+    language: Some("zh".into()),   // skip auto-detection
+    translate: true,               // translate the speech into English
     n_threads: Some(8),
     ..TranscriptionOptions::default()
 };
@@ -109,7 +157,7 @@ See `cargo run --example usage_example_chinese`.
 
 Anything not covered by `TranscriptionOptions` (grammars, callbacks, VAD, token-level DTW timestamps,
 GPU offload) stays reachable: build a `whisper_rs::FullParams` yourself and call
-`Transcriber::transcribe_with_params`, or use `Transcriber::new_with_params` to pass
+`session.transcribe_samples_with_params`, or use `Transcriber::new_with_params` to pass
 `WhisperContextParameters`.
 
 ### Live translation: the whole pipeline
@@ -169,11 +217,15 @@ Three findings that matter when you run it:
 `--file` swaps the microphone for a media file and runs the identical chain, which is how you check
 the conditioning stages without talking.
 
-### Better resampling with rubato
+### Resampling
 
-`whisper_stt::audio::resample` uses linear interpolation: cheap, but it lets everything above the
-new Nyquist limit alias back into the audio. When the resampling itself matters, rubato does it
-properly. `examples/resample.rs` measures both:
+Whisper wants 16 kHz, and whatever the source rate is, something has to bridge the gap. That
+something used to be linear interpolation, which is cheap and quietly wrong: everything above the new
+Nyquist limit folds back into the audio instead of being filtered out, and Whisper hears the folded
+noise as speech. `whisper_stt::audio::resample` now runs rubato's FFT resampler, which low-passes
+before it decimates.
+
+`examples/resample.rs` measures the built-in engine against rubato's heavier ones:
 
 ```text
 cargo run --example resample                                   # assets/test.mp3, every engine
@@ -190,12 +242,13 @@ engine               3 kHz kept    6 kHz alias
 fft                     -6.0 dB      < -120 dB
 sinc                    -6.0 dB      < -120 dB
 poly                    -6.0 dB        -8.4 dB
-linear (built-in)       -6.4 dB       -10.0 dB
+built-in                -6.0 dB      < -120 dB
 ```
 
-`Fft` is the default choice for fixed-rate file conversion, `Async::new_sinc` for a ratio that can
-drift, `Async::new_poly` when CPU matters more than the filter. rubato 5.0 works on `audioadapter`
-buffers, so the input is wrapped in an `InterleavedSlice` and read back through the `Adapter` trait.
+`Fft` — the built-in choice — is right for fixed-rate file conversion, `Async::new_sinc` for a ratio
+that can drift, `Async::new_poly` when CPU matters more than the filter. rubato 5.0 works on
+`audioadapter` buffers, so the input is wrapped in an `InterleavedSlice` and read back through the
+`Adapter` trait.
 
 ### Cutting silence before transcribing
 
@@ -254,18 +307,6 @@ for your terminal/IDE.
 cargo run --example models              # print the catalogue
 cargo run --example models -- tiny.en   # download one checkpoint into models/
 ```
-
-## Migration from the old `model_handler` API
-
-`ModelHandler` still exists as a thin shim so existing code keeps working:
-
-```rust
-let handler = whisper_stt::model_handler::ModelHandler::new("tiny", "models/").await;
-let transcriber = Transcriber::new(handler)?;
-```
-
-Prefer moving to `ModelStore`, which is checked against the catalogue at compile time and reports
-failures instead of panicking.
 
 ## License
 

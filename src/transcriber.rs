@@ -111,9 +111,9 @@ impl TranscriberOutput {
 /// it to [`Transcriber::transcribe_file`]; for anything not covered here, build a
 /// [`whisper_rs::FullParams`] by hand and use [`TranscriptionSession::transcribe_samples_with_params`].
 #[derive(Debug, Clone)]
-pub struct TranscriptionOptions<'a> {
+pub struct TranscriptionOptions {
     /// Force a source language (`"en"`, `"zh"`, `"auto"`, ...) instead of letting Whisper detect it.
-    pub language: Option<&'a str>,
+    pub language: Option<String>,
     /// Translate the speech into English instead of transcribing it.
     ///
     /// Requires a multilingual model; requests against an English-only checkpoint fail with
@@ -150,10 +150,10 @@ pub struct TranscriptionOptions<'a> {
     /// Number of threads to use. `None` lets whisper.cpp pick.
     pub n_threads: Option<i32>,
     /// Optional prompt prepended to the first window, useful for steering spelling and vocabulary.
-    pub initial_prompt: Option<&'a str>,
+    pub initial_prompt: Option<String>,
 }
 
-impl Default for TranscriptionOptions<'_> {
+impl Default for TranscriptionOptions {
     fn default() -> Self {
         Self {
             language: None,
@@ -171,7 +171,7 @@ impl Default for TranscriptionOptions<'_> {
     }
 }
 
-impl TranscriptionOptions<'_> {
+impl TranscriptionOptions {
     /// Options with all defaults applied.
     pub fn new() -> Self {
         Self::default()
@@ -183,7 +183,7 @@ impl TranscriptionOptions<'_> {
         params.set_translate(self.translate);
         params.set_print_progress(self.print_progress);
         params.set_print_special(self.print_special);
-        params.set_language(self.language);
+        params.set_language(self.language.as_deref());
         params.set_no_context(self.no_context);
         params.set_single_segment(self.single_segment);
         // whisper.cpp only has the per-token probabilities this needs when token timestamps are on.
@@ -197,7 +197,7 @@ impl TranscriptionOptions<'_> {
         if let Some(threads) = self.n_threads {
             params.set_n_threads(threads);
         }
-        if let Some(prompt) = self.initial_prompt {
+        if let Some(prompt) = self.initial_prompt.as_deref() {
             params.set_initial_prompt(prompt);
         }
         params
@@ -302,7 +302,7 @@ impl Transcriber {
     pub fn transcribe_file<P: AsRef<Path>>(
         &self,
         audio_path: P,
-        options: Option<&TranscriptionOptions<'_>>,
+        options: Option<&TranscriptionOptions>,
     ) -> Result<TranscriberOutput> {
         self.session()?.transcribe_file(audio_path, options)
     }
@@ -316,7 +316,7 @@ impl Transcriber {
     pub fn transcribe_decoded(
         &self,
         audio: &DecodedAudio,
-        options: Option<&TranscriptionOptions<'_>>,
+        options: Option<&TranscriptionOptions>,
     ) -> Result<TranscriberOutput> {
         self.session()?.transcribe_decoded(audio, options)
     }
@@ -329,7 +329,7 @@ impl Transcriber {
     pub fn transcribe_samples(
         &self,
         samples: &[f32],
-        options: Option<&TranscriptionOptions<'_>>,
+        options: Option<&TranscriptionOptions>,
     ) -> Result<TranscriberOutput> {
         self.session()?.transcribe_samples(samples, options)
     }
@@ -383,7 +383,7 @@ impl<'model> TranscriptionSession<'model> {
     pub fn transcribe_file<P: AsRef<Path>>(
         &mut self,
         audio_path: P,
-        options: Option<&TranscriptionOptions<'_>>,
+        options: Option<&TranscriptionOptions>,
     ) -> Result<TranscriberOutput> {
         let audio = audio::decode_file(audio_path)?;
         self.transcribe_decoded(&audio, options)
@@ -400,7 +400,7 @@ impl<'model> TranscriptionSession<'model> {
     pub fn transcribe_decoded(
         &mut self,
         audio: &DecodedAudio,
-        options: Option<&TranscriptionOptions<'_>>,
+        options: Option<&TranscriptionOptions>,
     ) -> Result<TranscriberOutput> {
         let samples = audio.to_whisper_input()?;
         self.transcribe_samples(&samples, options)
@@ -419,7 +419,7 @@ impl<'model> TranscriptionSession<'model> {
     pub fn transcribe_samples(
         &mut self,
         samples: &[f32],
-        options: Option<&TranscriptionOptions<'_>>,
+        options: Option<&TranscriptionOptions>,
     ) -> Result<TranscriberOutput> {
         if samples.is_empty() {
             return Err(Error::EmptyAudio);
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn options_convert_to_full_params() {
         let options = TranscriptionOptions {
-            language: Some("zh"),
+            language: Some("zh".into()),
             translate: true,
             print_progress: true,
             n_threads: Some(4),

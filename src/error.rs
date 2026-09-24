@@ -1,7 +1,7 @@
 //! Crate-wide error type.
 //!
 //! Every fallible operation in this crate returns [`Result<T>`], i.e.
-//! `std::result::Result<T, ` [`Error`] `>`.
+//! `std::result::Result<T, `[`Error`]`>`.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -18,15 +18,19 @@ pub enum Error {
     /// A model alias or file name does not match any known Whisper checkpoint.
     UnknownModel(String),
     /// The model file could not be found on disk.
+    ///
+    /// Also returned when the model would have to be downloaded but the crate was built without
+    /// the `network` feature.
     ModelNotFound(PathBuf),
     /// Downloading a model from the model repository failed.
+    #[cfg(feature = "network")]
     Download(reqwest::Error),
     /// The model repository answered with a non-success HTTP status.
     UnexpectedStatus {
         /// The URL that was requested.
         url: String,
         /// HTTP status returned by the server.
-        status: reqwest::StatusCode,
+        status: u16,
     },
     /// Whisper returned an error while loading a model or running transcription.
     Whisper(WhisperError),
@@ -53,6 +57,7 @@ impl fmt::Display for Error {
             Error::ModelNotFound(path) => {
                 write!(f, "model file not found at {}", path.display())
             }
+            #[cfg(feature = "network")]
             Error::Download(err) => write!(f, "model download failed: {err}"),
             Error::UnexpectedStatus { url, status } => {
                 write!(f, "request to {url} failed with status {status}")
@@ -74,6 +79,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "network")]
             Error::Download(err) => Some(err),
             Error::Whisper(err) => Some(err),
             Error::Io(err) => Some(err),
@@ -94,8 +100,42 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[cfg(feature = "network")]
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
         Error::Download(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_variant_has_a_message() {
+        let cases = [
+            Error::UnknownModel("nope".into()),
+            Error::ModelNotFound(PathBuf::from("models/ggml-tiny.bin")),
+            Error::UnexpectedStatus {
+                url: "https://example.invalid/a.bin".into(),
+                status: 404,
+            },
+            Error::Whisper(WhisperError::NoSamples),
+            Error::Io(std::io::Error::other("boom")),
+            Error::Audio("bad file".into()),
+            Error::NoAudioTrack,
+            Error::EmptyAudio,
+            Error::Resample("bad rate".into()),
+            Error::TranslationUnsupported,
+        ];
+        for error in cases {
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn io_errors_are_sourced() {
+        let error = Error::from(std::io::Error::other("boom"));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
