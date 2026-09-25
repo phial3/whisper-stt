@@ -66,21 +66,23 @@ rubato = "5.0"
 reqwest = { version = "0.13", optional = true }
 symphonia = { version = "0.6", default-features = false, features = ["opt-simd"] }
 
-[[bench]]
-name = "audio"
-harness = false
-
 [dev-dependencies]
 anyhow = "1"
 hf-hub = "1.0"
 ctrlc = "3.5"
 cpal = "0.18"
 hound = "3.5"
-rodio = "0.22"
+wavers = "1.5"
+chrono = "0.4"
 voice-engine = "0.3"
+rodio = { version = "0.22"}
 tokio = { version = "1.53", features = ["full"] }
 criterion = { version = "0.8", default-features = false }
 # Blocked: `flexaudio` 0.2 depends on `cpal` 0.16, whose ALSA backend pulls in
 # `alsa-sys`, and cargo will not let two packages claim the same `links = "alsa"`
 # in one graph. Revisit once flexaudio moves to cpal 0.18 (or drop our cpal dep).
 # flexaudio = "0.2"
+
+[[bench]]
+name = "audio"
+harness = false
