@@ -75,7 +75,7 @@ hound = "3.5"
 wavers = "1.5"
 chrono = "0.4"
 voice-engine = "0.3"
-rodio = { version = "0.22"}
+rodio = { version = "0.23"}
 tokio = { version = "1.53", features = ["full"] }
 criterion = { version = "0.8", default-features = false }
 # Blocked: `flexaudio` 0.2 depends on `cpal` 0.16, whose ALSA backend pulls in
